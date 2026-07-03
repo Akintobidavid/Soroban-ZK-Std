@@ -1229,6 +1229,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hackathon-shielded-asset"
+version = "0.1.0"
+dependencies = [
+ "ethnum",
+ "soroban-sdk",
+ "soroban-zk-core",
+ "soroban-zk-std",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
