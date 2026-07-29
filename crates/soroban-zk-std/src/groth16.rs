@@ -112,10 +112,22 @@ fn g2_from_bytes(bytes: &[u8]) -> Result<G2Affine, ZkError> {
     let y1 = read_fq(&bytes[64..96])?;
     let y0 = read_fq(&bytes[96..128])?;
 
-    Ok(G2Affine {
+    let g2 = G2Affine {
         x: (x0, x1),
         y: (y0, y1),
-    })
+    };
+
+    // Validate that the deserialized G2 point is on the curve and in the subgroup.
+    // This ensures that untrusted proof data cannot contain invalid G2 elements.
+    if !Bn254::is_valid_g2_curve((x0, x1), (y0, y1)) {
+        return Err(ZkError::DeserializationError);
+    }
+
+    if !Bn254::is_valid_g2_subgroup((x0, x1), (y0, y1)) {
+        return Err(ZkError::DeserializationError);
+    }
+
+    Ok(g2)
 }
 
 fn read_fq(bytes: &[u8]) -> Result<u256, ZkError> {
@@ -225,13 +237,45 @@ mod tests {
     }
 
     #[test]
-    fn proof_from_bytes_rejects_invalid_g1() {
+    fn proof_from_bytes_rejects_invalid_g2_not_on_curve() {
+        // Create a valid proof layout but with a G2 point perturbed to be off-curve
+        let valid_proof = Groth16Proof {
+            a: g1_generator(),
+            b: g2_generator(),
+            c: g1_generator(),
+        };
+
         let mut bytes = [0u8; 256];
-        bytes[63] = 1;
+        bytes[..64].copy_from_slice(&g1_to_bytes(&valid_proof.a));
+        bytes[64..192].copy_from_slice(&valid_proof.b.to_bytes());
+        bytes[192..].copy_from_slice(&g1_to_bytes(&valid_proof.c));
+
+        // Perturb the G2 y-coordinate (byte 64+32+32 = 128, real part)
+        // This changes y0 to be slightly different
+        bytes[128] = bytes[128].wrapping_add(1);
+
+        // The deserialized proof should reject this invalid G2 point
+        assert_eq!(
+            Groth16Proof::from_bytes(&bytes),
+            Err(ZkError::DeserializationError),
+            "Proof with off-curve G2 point should be rejected at deserialization"
+        );
+    }
+
+    #[test]
+    fn proof_from_bytes_rejects_g2_at_zero() {
+        let mut bytes = [0u8; 256];
+        // Set all G2 coordinates to zero (byte 64-192)
+        // bytes 64-192 are already zero from initialization
+        
+        bytes[..64].copy_from_slice(&g1_to_bytes(&g1_generator()));
+        // bytes[64..192] remain 0 (invalid G2 point at zero)
+        bytes[192..].copy_from_slice(&g1_to_bytes(&g1_generator()));
 
         assert_eq!(
             Groth16Proof::from_bytes(&bytes),
-            Err(ZkError::DeserializationError)
+            Err(ZkError::DeserializationError),
+            "Proof with G2 point at (0, 0) should be rejected"
         );
     }
 
