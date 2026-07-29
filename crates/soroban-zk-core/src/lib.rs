@@ -13,26 +13,343 @@ pub mod elgamal {
     }
 
     impl ElGamalCiphertext {
-        /// Stub for the encrypt function the contract is calling.
+        /// The BN254 G1 generator point (x=1, y=2).
+        ///
+        /// Uses `from_words` because `u256::from` is not a `const fn`.
+        pub const G: G1Affine = G1Affine {
+            x: u256::from_words(0, 1),
+            y: u256::from_words(0, 2),
+        };
+
+        /// EC-ElGamal encryption over BN254 G1.
+        ///
+        /// Maps a scalar `amount` to a curve point via `amount·G` and encrypts
+        /// it under `pub_key` using the ephemeral scalar `ephemeral`.
+        ///
+        /// # Output
+        /// - `c1 = ephemeral·G`        — the ephemeral public key
+        /// - `c2 = amount·G + ephemeral·pub_key` — the encrypted amount point
+        ///
+        /// # Errors
+        /// Returns [`ZkError::InvalidFieldElement`] if `amount` ≥ the BN254
+        /// scalar field modulus, since such values would wrap around in
+        /// `scalar_mul` and produce unexpected plaintexts.
+        ///
+        /// The caller MUST provide a fresh, uniformly random `ephemeral` for
+        /// each encryption; reuse leaks the relationship between plaintexts.
         pub fn encrypt(
             amount: u256,
-            _pub_key: &G1Affine,
-            _ephemeral: u256,
+            pub_key: &G1Affine,
+            ephemeral: u256,
         ) -> Result<Self, ZkError> {
-            // Mocking the encryption to satisfy the contract's assert_eq! test
-            let g = G1Affine {
-                x: u256::from(1u8),
-                y: u256::from(2u8),
-            };
-            Ok(Self {
-                c1: g,
-                c2: g.scalar_mul(amount), // Store the expected point here
-            })
+            // Validate amount is in the scalar field
+            if amount >= Bn254::BASE_MODULUS {
+                return Err(ZkError::InvalidFieldElement);
+            }
+
+            // c1 = ephemeral * G
+            let c1 = Self::G.scalar_mul(ephemeral);
+
+            // c2 = amount * G + ephemeral * pub_key
+            let amount_point = Self::G.scalar_mul(amount);
+            let shared_secret = pub_key.scalar_mul(ephemeral);
+            let c2 = amount_point.add(&shared_secret);
+
+            Ok(Self { c1, c2 })
         }
 
-        /// Stub for decryption that returns the mocked amount point
-        pub fn decrypt_amount_point(&self, _private_key: u256) -> Result<G1Affine, ZkError> {
-            Ok(self.c2)
+        /// Decrypts the ciphertext, recovering the amount point `amount·G`.
+        ///
+        /// `private_key` must be the scalar whose corresponding public key was
+        /// used during encryption (i.e., `pub_key = private_key·G`).
+        ///
+        /// # How it works
+        /// ```text
+        /// amount_point = c2 - private_key·c1
+        ///              = (amount·G + ephemeral·pub_key) - sk·(ephemeral·G)
+        ///              = amount·G + ephemeral·(sk·G) - sk·(ephemeral·G)
+        ///              = amount·G
+        /// ```
+        pub fn decrypt_amount_point(&self, private_key: u256) -> Result<G1Affine, ZkError> {
+            // shared = private_key * c1 = private_key * ephemeral * G
+            let shared_secret = self.c1.scalar_mul(private_key);
+
+            // Negate shared_secret: -(x, y) = (x, -y mod Fq)
+            let neg_shared_secret = G1Affine {
+                x: shared_secret.x,
+                y: Bn254::sub_fq(u256::from(0u8), shared_secret.y),
+            };
+
+            // c2 + (-shared_secret) = c2 - shared_secret = amount·G
+            Ok(self.c2.add(&neg_shared_secret))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Derive a public key from a private key: pk = sk·G
+        fn derive_pub_key(sk: u256) -> G1Affine {
+            ElGamalCiphertext::G.scalar_mul(sk)
+        }
+
+        #[test]
+        fn round_trip_encrypt_decrypt_small_amount() {
+            let amount = u256::from(42u8);
+            let sk = u256::from(7u8);
+            let ephemeral = u256::from(13u8);
+            let pk = derive_pub_key(sk);
+
+            let ct = ElGamalCiphertext::encrypt(amount, &pk, ephemeral)
+                .expect("encrypt should succeed");
+
+            let decrypted_point = ct
+                .decrypt_amount_point(sk)
+                .expect("decrypt should succeed");
+
+            // decrypted_point should equal amount·G
+            let expected = ElGamalCiphertext::G.scalar_mul(amount);
+            assert_eq!(decrypted_point, expected);
+        }
+
+        #[test]
+        fn round_trip_zero_amount() {
+            let amount = u256::from(0u8);
+            let sk = u256::from(5u8);
+            let ephemeral = u256::from(3u8);
+            let pk = derive_pub_key(sk);
+
+            let ct = ElGamalCiphertext::encrypt(amount, &pk, ephemeral)
+                .expect("encrypt should succeed");
+
+            let decrypted_point = ct
+                .decrypt_amount_point(sk)
+                .expect("decrypt should succeed");
+
+            // 0·G = point at infinity = (0, 0) in affine
+            assert_eq!(decrypted_point.x, u256::from(0u8));
+            assert_eq!(decrypted_point.y, u256::from(0u8));
+        }
+
+        #[test]
+        fn round_trip_large_amount() {
+            // Use a large amount that's still within Fr modulus
+            let amount = u256::from_words(0x1234567890abcdef_u128, 0xdeadbeefcafebabe_u128);
+            let sk = u256::from(12345u64);
+            let ephemeral = u256::from(98765u64);
+            let pk = derive_pub_key(sk);
+
+            let ct = ElGamalCiphertext::encrypt(amount, &pk, ephemeral)
+                .expect("encrypt should succeed");
+            let decrypted_point = ct
+                .decrypt_amount_point(sk)
+                .expect("decrypt should succeed");
+
+            let expected = ElGamalCiphertext::G.scalar_mul(amount);
+            assert_eq!(decrypted_point, expected);
+        }
+
+        #[test]
+        fn different_amounts_produce_different_c2() {
+            let sk = u256::from(7u8);
+            let ephemeral = u256::from(13u8);
+            let pk = derive_pub_key(sk);
+
+            let ct1 = ElGamalCiphertext::encrypt(u256::from(1u8), &pk, ephemeral)
+                .expect("encrypt should succeed");
+            let ct2 = ElGamalCiphertext::encrypt(u256::from(2u8), &pk, ephemeral)
+                .expect("encrypt should succeed");
+
+            // Same ephemeral → same c1
+            assert_eq!(ct1.c1, ct2.c1);
+            // Different amounts → different c2
+            assert_ne!(ct1.c2, ct2.c2);
+        }
+
+        #[test]
+        fn different_ephemerals_produce_different_ciphertexts() {
+            let amount = u256::from(42u8);
+            let sk = u256::from(7u8);
+            let pk = derive_pub_key(sk);
+
+            let ct1 = ElGamalCiphertext::encrypt(amount, &pk, u256::from(3u8))
+                .expect("encrypt should succeed");
+            let ct2 = ElGamalCiphertext::encrypt(amount, &pk, u256::from(5u8))
+                .expect("encrypt should succeed");
+
+            // Different ephemeral → different c1 AND c2
+            assert_ne!(ct1.c1, ct2.c1);
+            assert_ne!(ct1.c2, ct2.c2);
+        }
+
+        #[test]
+        fn different_keys_produce_different_ciphertexts() {
+            let amount = u256::from(42u8);
+            let ephemeral = u256::from(13u8);
+            let pk1 = derive_pub_key(u256::from(7u8));
+            let pk2 = derive_pub_key(u256::from(11u8));
+
+            let ct1 = ElGamalCiphertext::encrypt(amount, &pk1, ephemeral)
+                .expect("encrypt should succeed");
+            let ct2 = ElGamalCiphertext::encrypt(amount, &pk2, ephemeral)
+                .expect("encrypt should succeed");
+
+            // Same ephemeral → same c1
+            assert_eq!(ct1.c1, ct2.c1);
+            // Different pub keys → different c2
+            assert_ne!(ct1.c2, ct2.c2);
+        }
+
+        #[test]
+        fn decrypt_with_wrong_key_produces_wrong_point() {
+            let amount = u256::from(42u8);
+            let sk_correct = u256::from(7u8);
+            let sk_wrong = u256::from(11u8);
+            let ephemeral = u256::from(13u8);
+            let pk = derive_pub_key(sk_correct);
+
+            let ct = ElGamalCiphertext::encrypt(amount, &pk, ephemeral)
+                .expect("encrypt should succeed");
+
+            let decrypted_wrong = ct
+                .decrypt_amount_point(sk_wrong)
+                .expect("decrypt should succeed");
+
+            let expected = ElGamalCiphertext::G.scalar_mul(amount);
+            assert_ne!(decrypted_wrong, expected);
+        }
+
+        #[test]
+        fn encrypt_is_deterministic() {
+            let amount = u256::from(99u8);
+            let sk = u256::from(7u8);
+            let ephemeral = u256::from(31u8);
+            let pk = derive_pub_key(sk);
+
+            let ct1 = ElGamalCiphertext::encrypt(amount, &pk, ephemeral)
+                .expect("encrypt should succeed");
+            let ct2 = ElGamalCiphertext::encrypt(amount, &pk, ephemeral)
+                .expect("encrypt should succeed");
+
+            assert_eq!(ct1, ct2);
+        }
+
+        #[test]
+        fn encrypt_with_max_scalar_amount() {
+            // Fr modulus - 1 is the largest valid scalar
+            let amount = Bn254::BASE_MODULUS - u256::from(1u8);
+            let sk = u256::from(7u8);
+            let ephemeral = u256::from(13u8);
+            let pk = derive_pub_key(sk);
+
+            let ct = ElGamalCiphertext::encrypt(amount, &pk, ephemeral)
+                .expect("encrypt should succeed");
+
+            let decrypted_point = ct
+                .decrypt_amount_point(sk)
+                .expect("decrypt should succeed");
+
+            let expected = ElGamalCiphertext::G.scalar_mul(amount);
+            assert_eq!(decrypted_point, expected);
+        }
+
+        #[test]
+        fn encrypt_rejects_amount_above_modulus() {
+            let amount = Bn254::BASE_MODULUS; // exactly the modulus — invalid
+            let pk = derive_pub_key(u256::from(7u8));
+
+            let result = ElGamalCiphertext::encrypt(amount, &pk, u256::from(13u8));
+            assert_eq!(result, Err(ZkError::InvalidFieldElement));
+        }
+
+        #[test]
+        fn encrypt_rejects_amount_well_above_modulus() {
+            let amount = Bn254::BASE_MODULUS + u256::from(1000u16);
+            let pk = derive_pub_key(u256::from(7u8));
+
+            let result = ElGamalCiphertext::encrypt(amount, &pk, u256::from(13u8));
+            assert_eq!(result, Err(ZkError::InvalidFieldElement));
+        }
+
+        #[test]
+        fn encrypt_with_ephemeral_zero_produces_unrandomized_ciphertext() {
+            let amount = u256::from(42u8);
+            let sk = u256::from(7u8);
+            let pk = derive_pub_key(sk);
+
+            let ct = ElGamalCiphertext::encrypt(amount, &pk, u256::from(0u8))
+                .expect("encrypt should succeed");
+
+            // c1 = 0·G = identity
+            assert_eq!(ct.c1.x, u256::from(0u8));
+            assert_eq!(ct.c1.y, u256::from(0u8));
+            // c2 = amount·G + 0·pk = amount·G
+            let expected = ElGamalCiphertext::G.scalar_mul(amount);
+            assert_eq!(ct.c2, expected);
+
+            // Decryption still works
+            let decrypted = ct
+                .decrypt_amount_point(sk)
+                .expect("decrypt should succeed");
+            assert_eq!(decrypted, expected);
+        }
+
+        #[test]
+        fn homomorphic_addition_two_ciphertexts() {
+            // ElGamal is additively homomorphic:
+            //   Dec(sk, ct(a) + ct(b)) == (a+b)·G
+            let a = u256::from(30u8);
+            let b = u256::from(12u8);
+            let sk = u256::from(7u8);
+            let ephemeral_a = u256::from(5u8);
+            let ephemeral_b = u256::from(11u8);
+            let pk = derive_pub_key(sk);
+
+            let ct_a = ElGamalCiphertext::encrypt(a, &pk, ephemeral_a)
+                .expect("encrypt a");
+            let ct_b = ElGamalCiphertext::encrypt(b, &pk, ephemeral_b)
+                .expect("encrypt b");
+
+            // Homomorphic addition: sum c1 and c2 components independently
+            let sum_ct = ElGamalCiphertext {
+                c1: ct_a.c1.add(&ct_b.c1),
+                c2: ct_a.c2.add(&ct_b.c2),
+            };
+
+            let decrypted_sum = sum_ct
+                .decrypt_amount_point(sk)
+                .expect("decrypt sum");
+
+            let expected = ElGamalCiphertext::G.scalar_mul(a + b);
+            assert_eq!(decrypted_sum, expected);
+        }
+
+        #[test]
+        fn homomorphic_addition_with_single_ciphertext_and_plaintext() {
+            // Encrypt a, then add b·G to c2 (and keep c1 as-is)
+            let a = u256::from(100u8);
+            let b = u256::from(50u8);
+            let sk = u256::from(7u8);
+            let ephemeral = u256::from(13u8);
+            let pk = derive_pub_key(sk);
+
+            let ct = ElGamalCiphertext::encrypt(a, &pk, ephemeral)
+                .expect("encrypt a");
+
+            // Mixed addition: add b·G to c2 only
+            // Dec(sk, (c1, c2 + b·G)) = a·G + b·G = (a+b)·G
+            let ct_plus_b = ElGamalCiphertext {
+                c1: ct.c1,
+                c2: ct.c2.add(&ElGamalCiphertext::G.scalar_mul(b)),
+            };
+
+            let decrypted = ct_plus_b
+                .decrypt_amount_point(sk)
+                .expect("decrypt");
+
+            let expected = ElGamalCiphertext::G.scalar_mul(a + b);
+            assert_eq!(decrypted, expected);
         }
     }
 }
