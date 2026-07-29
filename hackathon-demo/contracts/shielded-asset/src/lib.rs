@@ -5,6 +5,7 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
 use soroban_zk_core::G1Affine;
 use soroban_zk_std::groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 use soroban_zk_std::pairing::G2Affine;
+use soroban_zk_std::poseidon2::hash_to_field;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,11 +52,65 @@ impl ShieldedAsset {
         let vk = get_verifying_key();
 
         // ── 5. VERIFY with soroban-zk-std ────────────────────────────────────
-        // public_inputs_bytes carries the caller-supplied public input scalar.
-        // Binding it to the actual transaction parameters is handled in #337;
-        // here we simply pass it through so verification is no longer skipped.
+        // Bind the first public input to the actual transaction parameters so
+        // a proof generated for one (sender, receiver, amount) triple cannot be
+        // replayed against a different one.
+        //
+        // Expected public input:
+        //   H = Poseidon2(sender_fe || receiver_fe || amount_fe)
+        //
+        // Encoding (each value zero-padded to a 32-byte BN254 Fr element):
+        //   sender_fe  : right-aligned ASCII bytes of the Stellar address (≤56 chars)
+        //   receiver_fe: right-aligned ASCII bytes of the Stellar address (≤56 chars)
+        //   amount_fe  : (amount as u128) in big-endian, zero-padded to 32 bytes
+        //
+        // The off-chain prover must use the same commitment so that any mismatch
+        // between the proof's public input and the on-chain parameters is caught
+        // by groth16_verify below.
+        if public_inputs_bytes.len() < 32 {
+            panic!("public_inputs_bytes too short: expected at least 32 bytes");
+        }
+
+        // Encode sender address.
+        let sender_raw = sender.to_string().to_bytes();
+        let sender_len = sender_raw.len().min(32) as usize;
+        let mut sender_padded = [0u8; 32];
+        {
+            let mut tmp = [0u8; 56]; // Stellar addresses are at most 56 chars
+            sender_raw.copy_into_slice(&mut tmp[..sender_raw.len() as usize]);
+            sender_padded[32 - sender_len..].copy_from_slice(&tmp[..sender_len]);
+        }
+
+        // Encode receiver address.
+        let receiver_raw = receiver.to_string().to_bytes();
+        let receiver_len = receiver_raw.len().min(32) as usize;
+        let mut receiver_padded = [0u8; 32];
+        {
+            let mut tmp = [0u8; 56];
+            receiver_raw.copy_into_slice(&mut tmp[..receiver_raw.len() as usize]);
+            receiver_padded[32 - receiver_len..].copy_from_slice(&tmp[..receiver_len]);
+        }
+
+        // Encode amount (i128 → u128 bit pattern, big-endian, zero-padded to 32 bytes).
+        let mut amount_padded = [0u8; 32];
+        amount_padded[16..].copy_from_slice(&(amount as u128).to_be_bytes());
+
+        let fe_sender   = soroban_sdk::U256::from_be_bytes(&env, &Bytes::from_array(&env, &sender_padded));
+        let fe_receiver = soroban_sdk::U256::from_be_bytes(&env, &Bytes::from_array(&env, &receiver_padded));
+        let fe_amount   = soroban_sdk::U256::from_be_bytes(&env, &Bytes::from_array(&env, &amount_padded));
+
+        let expected_pi = hash_to_field(&env, &[fe_sender, fe_receiver, fe_amount]);
+
+        // Read the first 32 bytes of the caller-supplied public input.
         let mut pi_buf = [0u8; 32];
         public_inputs_bytes.copy_into_slice(&mut pi_buf);
+        let supplied_pi_sdk = soroban_sdk::U256::from_be_bytes(&env, &Bytes::from_array(&env, &pi_buf));
+
+        if supplied_pi_sdk != expected_pi {
+            panic!("Public inputs do not match transaction parameters: possible proof replay attack");
+        }
+
+        // groth16_verify takes ethnum::u256; convert from the validated byte array.
         let public_input = u256::from_be_bytes(pi_buf);
 
         let is_valid = groth16_verify(&env, &vk, &proof, &[public_input])
