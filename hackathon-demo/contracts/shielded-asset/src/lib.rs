@@ -3,7 +3,7 @@
 use ethnum::u256;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
 use soroban_zk_core::G1Affine;
-use soroban_zk_std::groth16::{groth16_verify as _, Groth16Proof, Groth16VerifyingKey};
+use soroban_zk_std::groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 use soroban_zk_std::pairing::G2Affine;
 
 #[contracttype]
@@ -51,15 +51,21 @@ impl ShieldedAsset {
         let vk = get_verifying_key();
 
         // ── 5. VERIFY with soroban-zk-std ────────────────────────────────────
-        // NOTE: Commented out because testnet budget limit is currently too low for full verification
-        // let is_valid = groth16_verify(&env, &vk, &proof, &[public_input])
-        //    .expect("Verification failed due to malformed curve points");
+        // public_inputs_bytes carries the caller-supplied public input scalar.
+        // Binding it to the actual transaction parameters is handled in #337;
+        // here we simply pass it through so verification is no longer skipped.
+        let mut pi_buf = [0u8; 32];
+        public_inputs_bytes.copy_into_slice(&mut pi_buf);
+        let public_input = u256::from_be_bytes(pi_buf);
 
-        // if !is_valid {
-        //    panic!("ZK Proof is invalid! Transfer rejected by soroban-zk-std.");
-        // }
+        let is_valid = groth16_verify(&env, &vk, &proof, &[public_input])
+            .expect("Verification failed due to malformed curve points");
 
-        let _ = (&vk, &proof, &public_inputs_bytes); // suppress unused warnings until #336 and #337 land
+        if !is_valid {
+            panic!("ZK Proof is invalid! Transfer rejected by soroban-zk-std.");
+        }
+
+        let _ = &public_inputs_bytes; // consumed above; suppress any lint
 
         // ── 7. Update on-chain shielded balances ─────────────────────────────
         let mut sender_bal: i128 = env.storage().persistent().get(&sender).unwrap_or(0);
