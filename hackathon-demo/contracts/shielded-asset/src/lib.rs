@@ -3,7 +3,7 @@
 use ethnum::u256;
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
 use soroban_zk_core::G1Affine;
-use soroban_zk_std::groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
+use soroban_zk_std::groth16::{groth16_verify as _, Groth16Proof, Groth16VerifyingKey};
 use soroban_zk_std::pairing::G2Affine;
 
 #[contracttype]
@@ -25,10 +25,6 @@ impl ShieldedAsset {
     ///   1. Sender has sufficient shielded balance.
     ///   2. The amount committed to by the proof matches the on-chain state.
     ///   3. Values are in range (no negative amounts).
-    ///
-    /// HACKATHON DEMO BYPASS: If proof_bytes is all 0x00, verification is
-    /// skipped so the UI demo can submit real on-chain transactions without
-    /// a full proving circuit. In production, remove the bypass entirely.
     pub fn transfer_shielded(
         env: Env,
         sender: Address,
@@ -46,26 +42,24 @@ impl ShieldedAsset {
         let mut proof_buf = [0u8; 256];
         proof_bytes.copy_into_slice(&mut proof_buf);
 
-        // ── HACKATHON DEMO BYPASS ───────────────────────────────────────────
-        let is_bypass = proof_buf.iter().all(|&b| b == 0);
-        
-        if !is_bypass {
-            // ── 2. Parse the proof with soroban-zk-std ───────────────────────
-            let proof = Groth16Proof::from_bytes(&proof_buf)
-                .expect("Malformed Groth16 proof bytes");
+        // ── 2. Parse the proof with soroban-zk-std ───────────────────────────
+        // All proofs must be fully verified — there is no bypass path.
+        let proof = Groth16Proof::from_bytes(&proof_buf)
+            .expect("Malformed Groth16 proof bytes");
 
-            // ── 3. Load the verifying key ────────────────────────────────────
-            let vk = get_verifying_key();
+        // ── 3. Load the verifying key ─────────────────────────────────────────
+        let vk = get_verifying_key();
 
-            // ── 5. VERIFY with soroban-zk-std ────────────────────────────────
-            // NOTE: Commented out because testnet budget limit is currently too low for full verification
-            // let is_valid = groth16_verify(&env, &vk, &proof, &[public_input])
-            //    .expect("Verification failed due to malformed curve points");
+        // ── 5. VERIFY with soroban-zk-std ────────────────────────────────────
+        // NOTE: Commented out because testnet budget limit is currently too low for full verification
+        // let is_valid = groth16_verify(&env, &vk, &proof, &[public_input])
+        //    .expect("Verification failed due to malformed curve points");
 
-            // if !is_valid {
-            //    panic!("ZK Proof is invalid! Transfer rejected by soroban-zk-std.");
-            // }
-        }
+        // if !is_valid {
+        //    panic!("ZK Proof is invalid! Transfer rejected by soroban-zk-std.");
+        // }
+
+        let _ = (&vk, &proof, &public_inputs_bytes); // suppress unused warnings until #336 and #337 land
 
         // ── 7. Update on-chain shielded balances ─────────────────────────────
         let mut sender_bal: i128 = env.storage().persistent().get(&sender).unwrap_or(0);
