@@ -1,0 +1,10 @@
+{
+  "name": "hackathon-demo-root",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "cd frontend && pnpm dev",
+    "build": "cd frontend && pnpm build",
+    "start": "cd frontend && pnpm start"
+  }
+}
