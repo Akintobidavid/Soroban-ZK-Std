@@ -1,6 +1,7 @@
 "use client";
 import React, { useState, useEffect } from 'react';
 import { TransactionBuilder, Networks, Horizon, Contract, Address, rpc, nativeToScVal, xdr, SorobanDataBuilder, StrKey } from '@stellar/stellar-sdk';
+import { decryptAmount } from '../lib/decryption.mjs';
 
 const config = {
   backendUrl: process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3001',
@@ -31,6 +32,7 @@ export default function Home() {
   const [showModal, setShowModal] = useState(false);
   const [isDecrypted, setIsDecrypted] = useState(false);
   const [isDecrypting, setIsDecrypting] = useState(false);
+  const [decryptedAmount, setDecryptedAmount] = useState<number | null>(null);
   const [isUnshielding, setIsUnshielding] = useState(false);
   const [isShielding, setIsShielding] = useState(false);
   const [shieldStep, setShieldStep] = useState("");
@@ -86,11 +88,29 @@ export default function Home() {
 
 
   const handleDecrypt = async () => {
+    if (isDecrypting) return;
+
+    if (isDecrypted) {
+      setIsDecrypted(false);
+      setDecryptedAmount(null);
+      return;
+    }
+
     setIsDecrypting(true);
-    // Simulate complex zero-knowledge decryption
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    setIsDecrypted(!isDecrypted);
-    setIsDecrypting(false);
+
+    try {
+      const viewingKey = process.env.NEXT_PUBLIC_VIEWING_KEY || 'auditor-demo-viewing-key';
+      const nextAmount = await decryptAmount(shieldedBalance, viewingKey);
+      setDecryptedAmount(nextAmount);
+      setIsDecrypted(true);
+    } catch (error) {
+      console.error('Decryption failed:', error);
+      setDecryptedAmount(null);
+      setIsDecrypted(false);
+      alert('Decryption failed: ' + (error instanceof Error ? error.message : String(error)));
+    } finally {
+      setIsDecrypting(false);
+    }
   };
 
   const handleUnshield = async () => {
@@ -693,6 +713,11 @@ export default function Home() {
                     </>
                   )}
                 </button>
+                {isDecrypted && decryptedAmount !== null && (
+                  <div className="mt-3 text-center text-sm text-blue-200">
+                    Decrypted amount: <span className="font-semibold">{decryptedAmount.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} pXLM</span>
+                  </div>
+                )}
               </div>
 
             </div>
