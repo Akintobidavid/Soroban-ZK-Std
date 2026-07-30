@@ -173,10 +173,7 @@ impl ShieldedAsset {
     pub fn shield(env: Env, user: Address, amount: i128, delta: EncryptedBalance) {
         user.require_auth();
 
-        let native = Address::from_string(&soroban_sdk::String::from_str(
-            &env,
-            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-        ));
+        let native = Self::get_native_token(&env);
         soroban_sdk::token::Client::new(&env, &native)
             .transfer(&user, &env.current_contract_address(), &amount);
 
@@ -204,10 +201,7 @@ impl ShieldedAsset {
             .unwrap_or_else(|| EncryptedBalance::zero(&env));
         env.storage().persistent().set(&user, &bal.combine(&env, &delta));
 
-        let native = Address::from_string(&soroban_sdk::String::from_str(
-            &env,
-            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-        ));
+        let native = Self::get_native_token(&env);
         soroban_sdk::token::Client::new(&env, &native)
             .transfer(&env.current_contract_address(), &user, &amount);
 

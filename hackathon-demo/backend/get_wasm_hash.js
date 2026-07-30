@@ -1,5 +1,6 @@
 import { xdr, StrKey } from '@stellar/stellar-sdk';
-const contractId = 'CC5KGHEE6JB3ICEI3B4GCLMPFETSN5J44FCQLZN7TUWKG4E2TUKXI7CY';
+const SOROBAN_RPC = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+const contractId = process.env.CONTRACT_ID || 'CC5KGHEE6JB3ICEI3B4GCLMPFETSN5J44FCQLZN7TUWKG4E2TUKXI7CY';
 async function run() {
   const contractIdBuffer = StrKey.decodeContract(contractId);
   const ledgerKey = xdr.LedgerKey.contractData(new xdr.LedgerKeyContractData({
@@ -7,7 +8,7 @@ async function run() {
     key: xdr.ScVal.scvLedgerKeyContractInstance(),
     durability: xdr.ContractDataDurability.persistent(),
   }));
-  const res = await fetch('https://soroban-testnet.stellar.org', {
+  const res = await fetch(SOROBAN_RPC, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLedgerEntries', params: { keys: [ledgerKey.toXDR('base64')] } })
