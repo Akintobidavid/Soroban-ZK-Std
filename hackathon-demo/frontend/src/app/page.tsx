@@ -2,6 +2,24 @@
 import React, { useState, useEffect } from 'react';
 import { TransactionBuilder, Networks, Horizon, Contract, Address, rpc, nativeToScVal, xdr, SorobanDataBuilder, StrKey } from '@stellar/stellar-sdk';
 
+const config = {
+  backendUrl: process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3001',
+  sorobanRpc: process.env.NEXT_PUBLIC_SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
+  horizonRpc: process.env.NEXT_PUBLIC_HORIZON_RPC_URL || 'https://horizon-testnet.stellar.org',
+  friendbotUrl: process.env.NEXT_PUBLIC_FRIENDBOT_URL || 'https://friendbot.stellar.org',
+  networkPassphrase: process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || Networks.TESTNET,
+  contractId: process.env.NEXT_PUBLIC_CONTRACT_ID || 'CCE7SJDDRQEXOGF7PNIY26LY63ZUXGBIYXZ3ZY3J4MGSJSXFXTUS5NTN',
+  explorerTxUrl:
+    process.env.NEXT_PUBLIC_EXPLORER_TX_URL ||
+    'https://stellar.expert/explorer/testnet/tx/',
+  explorerContractUrl:
+    process.env.NEXT_PUBLIC_EXPLORER_CONTRACT_URL ||
+    'https://stellar.expert/explorer/testnet/contract/',
+  explorerDashboardUrl:
+    process.env.NEXT_PUBLIC_EXPLORER_DASHBOARD_URL ||
+    'https://lab.stellar.org/transaction/dashboard',
+};
+
 export default function Home() {
   const [address, setAddress] = useState<string | null>(null);
   const [balance, setBalance] = useState<string | null>(null);
@@ -22,7 +40,7 @@ export default function Home() {
 
   const fetchRealTransactions = async (pubKey: string) => {
     try {
-      const res = await fetch(`https://horizon-testnet.stellar.org/accounts/${pubKey}/transactions?order=desc&limit=10`);
+      const res = await fetch(`${config.horizonRpc}/accounts/${pubKey}/transactions?order=desc&limit=10`);
       const data = await res.json();
       setRealTransactions(data._embedded?.records || []);
     } catch(e) {
@@ -32,7 +50,7 @@ export default function Home() {
 
   const fetchContractEvents = async () => {
     try {
-      const res = await fetch('http://localhost:3001/api/contract-events');
+      const res = await fetch(`${config.backendUrl}/api/contract-events`);
       const data = await res.json();
       setContractEvents(data.events || []);
     } catch(e) {
@@ -48,10 +66,10 @@ export default function Home() {
   const syncWithBackend = async (pubKey: string) => {
     try {
       // Trigger a chain event sync on the backend first
-      await fetch(`http://localhost:3001/api/sync`).catch(() => {});
+      await fetch(`${config.backendUrl}/api/sync`).catch(() => {});
 
       // Then get address-specific state (balance from contract + txs from DB)
-      const res = await fetch(`http://localhost:3001/api/sync/${pubKey}`);
+      const res = await fetch(`${config.backendUrl}/api/sync/${pubKey}`);
       const data = await res.json();
       if (data.shieldedBalance !== undefined) {
         setShieldedBalance(data.shieldedBalance);
@@ -80,8 +98,8 @@ export default function Home() {
     setIsUnshielding(true);
     
     try {
-      const sorobanServer = new rpc.Server("https://soroban-testnet.stellar.org");
-      const horizonServer = new Horizon.Server("https://horizon-testnet.stellar.org");
+      const sorobanServer = new rpc.Server(config.sorobanRpc);
+      const horizonServer = new Horizon.Server(config.horizonRpc);
       
       let sourceAccount;
       try {
@@ -89,11 +107,11 @@ export default function Home() {
       } catch (e) {
         // Account doesn't exist yet, fund it with Friendbot!
         setSendStep("Funding account via Friendbot...");
-        await fetch(`https://friendbot.stellar.org?addr=${address}`);
+        await fetch(`${config.friendbotUrl}?addr=${address}`);
         sourceAccount = await horizonServer.loadAccount(address);
       }
       
-      const contractId = process.env.NEXT_PUBLIC_CONTRACT_ID || "CCE7SJDDRQEXOGF7PNIY26LY63ZUXGBIYXZ3ZY3J4MGSJSXFXTUS5NTN";
+      const contractId = config.contractId;
       const contract = new Contract(contractId);
       
       const userScVal = Address.fromString(address).toScVal();
@@ -106,7 +124,7 @@ export default function Home() {
 
       let tx = new TransactionBuilder(sourceAccount, {
         fee: "1000",
-        networkPassphrase: Networks.TESTNET,
+        networkPassphrase: config.networkPassphrase,
       })
       .addOperation(op)
       .setTimeout(30)
@@ -117,10 +135,10 @@ export default function Home() {
       const kitModule = await import('@creit.tech/stellar-wallets-kit');
       
       const { signedTxXdr } = await kitModule.StellarWalletsKit.signTransaction(tx.toXDR(), {
-        networkPassphrase: Networks.TESTNET,
+        networkPassphrase: config.networkPassphrase,
       });
       
-      const signedTx = TransactionBuilder.fromXDR(signedTxXdr, Networks.TESTNET);
+      const signedTx = TransactionBuilder.fromXDR(signedTxXdr, config.networkPassphrase);
       const response = await sorobanServer.sendTransaction(signedTx as any);
       
       await new Promise(resolve => setTimeout(resolve, 1500));
@@ -128,7 +146,7 @@ export default function Home() {
       // Use the REAL transaction hash
       const realHash = response.hash || (signedTx as any).hash().toString("hex");
       
-      await fetch('http://localhost:3001/api/transactions', {
+      await fetch('${config.backendUrl}/api/transactions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -146,7 +164,7 @@ export default function Home() {
       fetchContractEvents();
 
       // Update native balance from Horizon
-      const horizonServer2 = new Horizon.Server("https://horizon-testnet.stellar.org");
+      const horizonServer2 = new Horizon.Server(config.horizonRpc);
       const newBal = await horizonServer2.loadAccount(address);
       const native = newBal.balances.find((b: any) => b.asset_type === 'native');
       if (native) setBalance(native.balance);
@@ -189,7 +207,7 @@ export default function Home() {
         setAddress(result.address);
         
         // Fetch balance from Testnet
-        fetch(`https://horizon-testnet.stellar.org/accounts/${result.address}`)
+        fetch(`${config.horizonRpc}/accounts/${result.address}`)
           .then(res => res.json())
           .then(data => {
             if (data.balances) {
@@ -218,24 +236,24 @@ export default function Home() {
 
     setIsShielding(true);
     try {
-      const sorobanServer = new rpc.Server("https://soroban-testnet.stellar.org");
-      const horizonServer = new Horizon.Server("https://horizon-testnet.stellar.org");
+      const sorobanServer = new rpc.Server(config.sorobanRpc);
+      const horizonServer = new Horizon.Server(config.horizonRpc);
       let sourceAccount;
       try { sourceAccount = await horizonServer.loadAccount(address); }
       catch (e) {
         setShieldStep("Funding account via Friendbot...");
-        await fetch(`https://friendbot.stellar.org?addr=${address}`);
+        await fetch(`${config.friendbotUrl}?addr=${address}`);
         sourceAccount = await horizonServer.loadAccount(address);
       }
 
-      const contractId = process.env.NEXT_PUBLIC_CONTRACT_ID || "CCE7SJDDRQEXOGF7PNIY26LY63ZUXGBIYXZ3ZY3J4MGSJSXFXTUS5NTN";
+      const contractId = config.contractId;
       const contract = new Contract(contractId);
       const userScVal = Address.fromString(address).toScVal();
       const amountInStroops = Math.floor(parsedAmount * 10000000);
       const amountScVal = nativeToScVal(amountInStroops, { type: 'i128' });
 
       setShieldStep("Preparing shield transaction...");
-      let tx = new TransactionBuilder(sourceAccount, { fee: "1000", networkPassphrase: Networks.TESTNET })
+      let tx = new TransactionBuilder(sourceAccount, { fee: "1000", networkPassphrase: config.networkPassphrase })
         .addOperation(contract.call("shield", userScVal, amountScVal))
         .setTimeout(30)
         .build();
@@ -243,10 +261,10 @@ export default function Home() {
 
       const kitModule = await import('@creit.tech/stellar-wallets-kit');
       setShieldStep("Sign in wallet...");
-      const { signedTxXdr } = await kitModule.StellarWalletsKit.signTransaction(tx.toXDR(), { networkPassphrase: Networks.TESTNET });
+      const { signedTxXdr } = await kitModule.StellarWalletsKit.signTransaction(tx.toXDR(), { networkPassphrase: config.networkPassphrase });
 
       setShieldStep("Submitting to Testnet...");
-      const signedTx = TransactionBuilder.fromXDR(signedTxXdr, Networks.TESTNET);
+      const signedTx = TransactionBuilder.fromXDR(signedTxXdr, config.networkPassphrase);
       const sendRes = await sorobanServer.sendTransaction(signedTx as any);
       const txHash = sendRes.hash;
 
@@ -272,11 +290,11 @@ export default function Home() {
       // Sync backend until the new shielded balance is reflected.
       // We must read from the API directly — shieldedBalance is a stale closure here.
       setShieldStep("Shielded! Syncing balance...");
-      await fetch(`http://localhost:3001/api/sync`).catch(() => {});
+      await fetch(`${config.backendUrl}/api/sync`).catch(() => {});
       for (let retry = 0; retry < 8; retry++) {
         await new Promise(resolve => setTimeout(resolve, 2000));
         try {
-          const res = await fetch(`http://localhost:3001/api/sync/${address}`);
+          const res = await fetch(`${config.backendUrl}/api/sync/${address}`);
           const data = await res.json();
           if (data.shieldedBalance !== undefined) {
             setShieldedBalance(data.shieldedBalance);
@@ -310,17 +328,17 @@ export default function Home() {
 
     setIsSending(true);
     try {
-      const sorobanServer = new rpc.Server("https://soroban-testnet.stellar.org");
-      const horizonServer = new Horizon.Server("https://horizon-testnet.stellar.org");
+      const sorobanServer = new rpc.Server(config.sorobanRpc);
+      const horizonServer = new Horizon.Server(config.horizonRpc);
       let sourceAccount;
       try { sourceAccount = await horizonServer.loadAccount(address); }
       catch (e) {
         setSendStep("Funding account via Friendbot...");
-        await fetch(`https://friendbot.stellar.org?addr=${address}`);
+        await fetch(`${config.friendbotUrl}?addr=${address}`);
         sourceAccount = await horizonServer.loadAccount(address);
       }
 
-      const contractId = process.env.NEXT_PUBLIC_CONTRACT_ID || "CCE7SJDDRQEXOGF7PNIY26LY63ZUXGBIYXZ3ZY3J4MGSJSXFXTUS5NTN";
+      const contractId = config.contractId;
       const contract = new Contract(contractId);
       const senderScVal = Address.fromString(address).toScVal();
       const receiverScVal = Address.fromString(receiverAddress).toScVal();
@@ -380,7 +398,7 @@ export default function Home() {
       // ── Build the raw transaction ──
       const rawTx = new TransactionBuilder(sourceAccount, {
         fee: "15000000", // Start with a massive base fee (1.5 XLM)
-        networkPassphrase: Networks.TESTNET,
+        networkPassphrase: config.networkPassphrase,
       })
         .addOperation(contract.call("transfer_shielded", senderScVal, receiverScVal, amountScVal, dummyProofScVal, piScVal))
         .setTimeout(30)
@@ -405,14 +423,14 @@ export default function Home() {
       txEnv.v1().tx().ext(new xdr.TransactionExt(1, sorobanData));
       txEnv.v1().tx().fee(txEnv.v1().tx().fee() + 500000);
 
-      tx = TransactionBuilder.fromXDR(txEnv.toXDR("base64"), Networks.TESTNET) as any;
+      tx = TransactionBuilder.fromXDR(txEnv.toXDR("base64"), config.networkPassphrase) as any;
 
       const kitModule = await import('@creit.tech/stellar-wallets-kit');
       setSendStep("Sign ZK Transfer in wallet...");
-      const { signedTxXdr } = await kitModule.StellarWalletsKit.signTransaction(tx.toXDR(), { networkPassphrase: Networks.TESTNET });
+      const { signedTxXdr } = await kitModule.StellarWalletsKit.signTransaction(tx.toXDR(), { networkPassphrase: config.networkPassphrase });
 
       setSendStep("Verifying Proof via Backend Relayer...");
-      const verifyRes = await fetch('http://localhost:3001/api/verify-and-send', {
+      const verifyRes = await fetch('${config.backendUrl}/api/verify-and-send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -435,7 +453,7 @@ export default function Home() {
       const displayAmount = parsedAmount.toFixed(2) + " XLM";
 
       try {
-        await fetch('http://localhost:3001/api/transactions', {
+        await fetch('${config.backendUrl}/api/transactions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ hash: realHash, sender: address, receiver: receiverAddress, amount: displayAmount, type: 'transfer' })
@@ -716,7 +734,7 @@ export default function Home() {
                         </tr>
                       ) : (
                         realTransactions.map(tx => (
-                          <tr key={tx.id} className="border-b border-white/5 hover:bg-white/5 cursor-pointer transition-colors" onClick={() => window.open(`https://lab.stellar.org/transaction/dashboard?$=network$id=testnet&label=Testnet&horizonUrl=https:////horizon-testnet.stellar.org&rpcUrl=https:////soroban-testnet.stellar.org&passphrase=Test%20SDF%20Network%20/;%20September%202015;&txDashboard$transactionHash=${tx.hash}`)}>
+                          <tr key={tx.id} className="border-b border-white/5 hover:bg-white/5 cursor-pointer transition-colors" onClick={() => window.open(`${config.explorerDashboardUrl}?$=network$id=testnet&label=Testnet&horizonUrl=${config.horizonRpc}&rpcUrl=${config.sorobanRpc}&passphrase=${encodeURIComponent(config.networkPassphrase)};&txDashboard$transactionHash=${tx.hash}`)}>
                             <td className="py-5 px-2">{new Date(tx.created_at).toLocaleString()}</td>
                             <td className="py-5 px-2 text-purple-400 font-mono truncate max-w-[180px]">{tx.hash}</td>
                             <td className="py-5 px-2 font-mono truncate max-w-[150px]">CA6B...EXGP (Contract)</td>

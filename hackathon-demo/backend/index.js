@@ -12,12 +12,16 @@ const app = new Hono();
 app.use('*', cors());
 
 // ── Soroban helpers ──────────────────────────────────────────────────────────
-const SOROBAN_RPC   = 'https://soroban-testnet.stellar.org';
-const HORIZON_RPC   = 'https://horizon-testnet.stellar.org';
+const SOROBAN_RPC   = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+const HORIZON_RPC   = process.env.HORIZON_RPC_URL || 'https://horizon-testnet.stellar.org';
+const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || Networks.TESTNET;
 const CONTRACT_ID   = process.env.CONTRACT_ID || 'CCE7SJDDRQEXOGF7PNIY26LY63ZUXGBIYXZ3ZY3J4MGSJSXFXTUS5NTN';
 
 // A fixed dummy account used only for read-only simulations (no auth needed)
-const SIM_ACCOUNT   = new Account('GBA2SJQYYNSPMLPZBJBYWUC6KROU6LUFPYPHYIU2WNMVMOIY7WOQ5HYW', '0');
+const SIM_ACCOUNT   = new Account(
+  process.env.SIM_ACCOUNT_PUBKEY || 'GBA2SJQYYNSPMLPZBJBYWUC6KROU6LUFPYPHYIU2WNMVMOIY7WOQ5HYW',
+  '0'
+);
 
 const sorobanServer = new rpc.Server(SOROBAN_RPC);
 const contract      = new Contract(CONTRACT_ID);
@@ -38,7 +42,7 @@ async function sorobanRpc(method, params = null) {
 async function fetchOnChainBalance(address) {
   try {
     const op  = contract.call('get_balance', Address.fromString(address).toScVal());
-    const tx  = new TransactionBuilder(SIM_ACCOUNT, { fee: '100', networkPassphrase: Networks.TESTNET })
+    const tx  = new TransactionBuilder(SIM_ACCOUNT, { fee: '100', networkPassphrase: NETWORK_PASSPHRASE })
       .addOperation(op).setTimeout(30).build();
 
     const result = await sorobanRpc('simulateTransaction', { transaction: tx.toXDR() });
@@ -273,8 +277,8 @@ app.get('/api/contract-events', async (c) => {
         type:       eventName,
         sender:     sender ? String(sender) : null,
         receiver:   receiver ? String(receiver) : null,
-        explorerUrl: `https://stellar.expert/explorer/testnet/tx/${evt.txHash}`,
-        contractUrl: `https://stellar.expert/explorer/testnet/contract/${CONTRACT_ID}`,
+        explorerUrl: `${process.env.EXPLORER_TX_URL || 'https://stellar.expert/explorer/testnet/tx/'}${evt.txHash}`,
+        contractUrl: `${process.env.EXPLORER_CONTRACT_URL || 'https://stellar.expert/explorer/testnet/contract/'}${CONTRACT_ID}`,
       };
     });
 
@@ -364,8 +368,8 @@ app.post('/api/verify-and-send', async (c) => {
     console.log("✅ ZK Proof verified successfully in backend!");
 
     // 3. Submit the signed transaction to Soroban Testnet
-    const signedTx = TransactionBuilder.fromXDR(signedTxXdr, Networks.TESTNET);
-    const sorobanSender = new rpc.Server("https://soroban-testnet.stellar.org");
+    const signedTx = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE);
+    const sorobanSender = new rpc.Server(SOROBAN_RPC);
     const response = await sorobanSender.sendTransaction(signedTx);
     
     if (response.status === "ERROR") {

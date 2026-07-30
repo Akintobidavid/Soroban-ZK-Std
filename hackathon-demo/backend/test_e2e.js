@@ -1,6 +1,8 @@
 import { rpc, Contract, Address, TransactionBuilder, Networks, Account, xdr, nativeToScVal, Keypair } from '@stellar/stellar-sdk';
-const SOROBAN_RPC = 'https://soroban-testnet.stellar.org';
-const CONTRACT_ID = 'CCE7SJDDRQEXOGF7PNIY26LY63ZUXGBIYXZ3ZY3J4MGSJSXFXTUS5NTN';
+const SOROBAN_RPC = process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org';
+const FRIENDBOT_URL = process.env.FRIENDBOT_URL || 'https://friendbot.stellar.org';
+const NETWORK_PASSPHRASE = process.env.NETWORK_PASSPHRASE || Networks.TESTNET;
+const CONTRACT_ID = process.env.CONTRACT_ID || 'CCE7SJDDRQEXOGF7PNIY26LY63ZUXGBIYXZ3ZY3J4MGSJSXFXTUS5NTN';
 const contract = new Contract(CONTRACT_ID);
 
 // Create a new keypair and fund it with friendbot
@@ -10,7 +12,7 @@ const sec = kp.secret();
 
 async function test() {
   console.log("Funding account...", pub);
-  await fetch(`https://friendbot.stellar.org?addr=${pub}`);
+  await fetch(`${FRIENDBOT_URL}?addr=${pub}`);
   
   const server = new rpc.Server(SOROBAN_RPC);
   const account = await server.getAccount(pub);
@@ -19,7 +21,7 @@ async function test() {
   // 1. Shield 1 XLM
   console.log("Shielding 1 XLM...");
   const op1 = contract.call('shield', Address.fromString(pub).toScVal(), nativeToScVal(10000000, { type: 'i128' }));
-  let tx1 = new TransactionBuilder(sourceAccount, { fee: '10000', networkPassphrase: Networks.TESTNET }).addOperation(op1).setTimeout(30).build();
+  let tx1 = new TransactionBuilder(sourceAccount, { fee: '10000', networkPassphrase: NETWORK_PASSPHRASE }).addOperation(op1).setTimeout(30).build();
   tx1 = await server.prepareTransaction(tx1);
   tx1.sign(kp);
   const res1 = await server.sendTransaction(tx1);
@@ -32,7 +34,7 @@ async function test() {
   const sourceAccount2 = new Account(account2.accountId(), account2.sequenceNumber());
   
   const op2 = contract.call('unshield', Address.fromString(pub).toScVal(), nativeToScVal(10000000, { type: 'i128' }));
-  let tx2 = new TransactionBuilder(sourceAccount2, { fee: '10000', networkPassphrase: Networks.TESTNET }).addOperation(op2).setTimeout(30).build();
+  let tx2 = new TransactionBuilder(sourceAccount2, { fee: '10000', networkPassphrase: NETWORK_PASSPHRASE }).addOperation(op2).setTimeout(30).build();
   tx2 = await server.prepareTransaction(tx2);
   tx2.sign(kp);
   const res2 = await server.sendTransaction(tx2);

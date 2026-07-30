@@ -1,7 +1,7 @@
 #![no_std]
 
 use ethnum::u256;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env, Symbol};
 use soroban_zk_core::G1Affine;
 use soroban_zk_std::groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 use soroban_zk_std::pairing::G2Affine;
@@ -21,6 +21,23 @@ pub struct ShieldedAsset;
 
 #[contractimpl]
 impl ShieldedAsset {
+    /// Initialize the contract with the native token address.
+    /// Must be called once after deployment.
+    pub fn initialize(env: Env, native_token: Address) {
+        assert!(
+            !env.storage().instance().has(&Symbol::new(&env, "NativeToken")),
+            "already initialized"
+        );
+        env.storage().instance().set(&Symbol::new(&env, "NativeToken"), &native_token);
+    }
+
+    fn get_native_token(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(env, "NativeToken"))
+            .expect("contract not initialized: call initialize() first")
+    }
+
     /// Transfers a shielded amount between two users.
     /// The ZK Proof (via soroban-zk-std Groth16) guarantees:
     ///   1. Sender has sufficient shielded balance.
@@ -147,10 +164,7 @@ impl ShieldedAsset {
     pub fn shield(env: Env, user: Address, amount: i128) {
         user.require_auth();
 
-        let native = Address::from_string(&soroban_sdk::String::from_str(
-            &env,
-            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-        ));
+        let native = Self::get_native_token(&env);
         soroban_sdk::token::Client::new(&env, &native)
             .transfer(&user, &env.current_contract_address(), &amount);
 
@@ -173,10 +187,7 @@ impl ShieldedAsset {
         bal -= amount;
         env.storage().persistent().set(&user, &bal);
 
-        let native = Address::from_string(&soroban_sdk::String::from_str(
-            &env,
-            "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-        ));
+        let native = Self::get_native_token(&env);
         soroban_sdk::token::Client::new(&env, &native)
             .transfer(&env.current_contract_address(), &user, &amount);
 
