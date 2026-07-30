@@ -42,7 +42,13 @@ fn u(env: &Env, hi: u128, lo: u128) -> U256 {
 /// Both inputs must be < r. The modulus is passed in so callers can reuse a
 /// cached value instead of rebuilding it on every addition.
 fn field_add(a: &U256, b: &U256, modulus: &U256) -> U256 {
-    let sum = a.add(b);
+    // Soroban U256 addition can panic if the sum exceeds the 256-bit range.
+    // Reduce each operand modulo the field modulus first, then add the reduced
+    // values. Since each operand is now < modulus, their sum is always safe.
+    let a_mod = if a >= modulus { a.sub(modulus) } else { a.clone() };
+    let b_mod = if b >= modulus { b.sub(modulus) } else { b.clone() };
+
+    let sum = a_mod.add(&b_mod);
     if sum >= *modulus {
         sum.sub(modulus)
     } else {
@@ -731,6 +737,18 @@ mod tests {
                 0xe660b145994427cc86296242cf766ec8
             )
         );
+    }
+
+    #[test]
+    fn field_add_reduces_when_sum_exceeds_modulus() {
+        let env = env();
+        let modulus = fr_modulus(&env);
+        let a = modulus.clone().sub(&U256::from_u128(&env, 1));
+        let b = U256::from_u128(&env, 2);
+
+        let result = field_add(&a, &b, &modulus);
+
+        assert_eq!(result, U256::from_u128(&env, 1));
     }
 
     #[test]
