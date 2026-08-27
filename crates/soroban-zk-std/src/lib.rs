@@ -1,5 +1,6 @@
 #![no_std]
 pub mod cache;
+pub mod gadgets;
 pub mod groth16;
 pub mod pairing;
 pub mod poseidon2;

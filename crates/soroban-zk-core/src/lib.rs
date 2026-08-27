@@ -367,6 +367,10 @@ pub enum ZkError {
     InvalidInput,
     /// Serialized proof or point bytes could not be decoded into a valid structure.
     DeserializationError,
+    /// A circuit constraint (range, boolean, decomposition, lookup, etc.) was not
+    /// satisfied by the supplied witness. A malicious prover cannot satisfy these
+    /// checks without producing an invalid proof.
+    ConstraintUnsatisfied,
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.
