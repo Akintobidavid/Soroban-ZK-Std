@@ -75,10 +75,10 @@ pub(crate) fn g1_to_bytes(g1: &G1Affine) -> [u8; 64] {
 pub(crate) fn validate_g2_coords(g2: &G2Affine) -> bool {
     let (x0, x1) = g2.x;
     let (y0, y1) = g2.y;
-    Bn254::is_valid_fq(x0)
-        && Bn254::is_valid_fq(x1)
-        && Bn254::is_valid_fq(y0)
-        && Bn254::is_valid_fq(y1)
+
+    // is_on_curve also enforces field-element membership of the coordinates.
+    Bn254::is_on_curve((x0, x1), (y0, y1))
+        && Bn254::is_in_correct_subgroup((x0, x1), (y0, y1))
 }
 
 /// Validates that a G2 point is both on the BN254 curve and in the prime-order subgroup.
@@ -86,7 +86,7 @@ pub(crate) fn validate_g2_coords(g2: &G2Affine) -> bool {
 /// This function performs two essential security checks:
 /// 
 /// 1. **Curve membership (on-curve check):** Verifies that the point (x, y) satisfies
-///    the BN254 G2 curve equation: y² = x³ + β over Fq², where β = 3 + 19*u.
+///    the BN254 G2 curve equation: y² = x³ + β over Fq², where β = 3/(u + 9).
 ///    
 ///    **Why this matters:** Without this check, a malicious prover could submit
 ///    a point with valid field-element coordinates that does NOT lie on the curve.
