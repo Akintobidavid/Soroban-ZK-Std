@@ -374,6 +374,9 @@ pub enum ZkError {
     /// A storage operation (read/write/remove) failed or required data was
     /// missing from the Soroban ledger.
     StorageError,
+     /// A zero-knowledge constraint or gadget invariant was violated by the
+    /// supplied witness (e.g. a boolean gadget received a non-0/1 value).
+    ConstraintUnsatisfied,
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.
@@ -785,6 +788,19 @@ impl Bn254 {
         y_sq == rhs
     }
 
+    /// Returns `true` if `(x, y)` (each an `Fq2` element as `(real, imag)`) lies
+    /// on the BN254 G2 twist curve `y² = x³ + b'`.
+    pub fn is_valid_g2_curve(x: (u256, u256), y: (u256, u256)) -> bool {
+        Self::is_on_curve(x, y)
+    }
+
+    /// Returns `true` if `(x, y)` lies on the curve AND in the prime-order
+    /// subgroup. Required before using any G2 point in a pairing check — a
+    /// point on the curve but outside the subgroup breaks soundness.
+    pub fn is_valid_g2_subgroup(x: (u256, u256), y: (u256, u256)) -> bool {
+        Self::is_in_correct_subgroup(x, y)
+    }
+
     pub fn is_valid_g1_subgroup(x: u256, y: u256) -> bool {
         if !Self::is_valid_g1(x, y) {
             return false;
@@ -967,7 +983,7 @@ impl Bn254 {
         };
 
         // [r]·Q must be the point at infinity (z == 0 in Jacobian coordinates).
-        let result = Self::g2_scalar_mul(point, Self::BASE_MODULUS);
+        let result = Self::g2_scalar_mul(point, Self::FR_MODULUS);
         result.is_identity()
     }
 
