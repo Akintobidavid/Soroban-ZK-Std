@@ -2395,6 +2395,7 @@ dependencies = [
  "ark-std 0.6.0",
  "ethnum",
  "num-bigint 0.5.1",
+ "sha2",
  "soroban-sdk",
  "soroban-zk-core",
 ]

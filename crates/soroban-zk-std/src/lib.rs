@@ -2,6 +2,7 @@
 extern crate alloc;
 
 pub mod cache;
+pub mod gadgets;
 pub mod groth16;
 pub mod host;
 pub mod pairing;
