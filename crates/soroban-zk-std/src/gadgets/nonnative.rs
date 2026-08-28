@@ -93,60 +93,72 @@ fn base() -> eth_u256 {
     eth_u256::ONE << LIMB_BITS
 }
 
-fn cmp(a: &Bignum, b: &Bignum) -> core::cmp::Ordering {
-    if a.len != b.len {
-        return a.len.cmp(&b.len);
-    }
-    for i in (0..a.len).rev() {
-        if a.limbs[i] > b.limbs[i] {
-            return core::cmp::Ordering::Greater;
-        } else if a.limbs[i] < b.limbs[i] {
-            return core::cmp::Ordering::Less;
-        }
-    }
-    core::cmp::Ordering::Equal
+/// Branchless select: returns `a` if `mask_true`, else `b`. Never branches
+/// on `mask_true` — the condition is folded into a bitmask (Issue #372).
+#[inline(always)]
+fn ct_select_u256(mask_true: bool, a: eth_u256, b: eth_u256) -> eth_u256 {
+    let mask = eth_u256::ZERO.wrapping_sub(eth_u256::from(mask_true as u8));
+    (a & mask) | (b & !mask)
 }
 
+/// Constant-time-oriented comparison: always scans all `MAX_LIMBS` slots
+/// instead of early-exiting on `a.len`/`b.len`, so timing does not leak the
+/// magnitude of either operand (Issue #372).
+fn cmp(a: &Bignum, b: &Bignum) -> core::cmp::Ordering {
+    let mut result = core::cmp::Ordering::Equal;
+    for i in (0..MAX_LIMBS).rev() {
+        let ai = ct_select_u256(i < a.len, a.limbs[i], eth_u256::ZERO);
+        let bi = ct_select_u256(i < b.len, b.limbs[i], eth_u256::ZERO);
+        let this_cmp = ai.cmp(&bi);
+        let still_equal = result == core::cmp::Ordering::Equal;
+        result = if still_equal { this_cmp } else { result };
+    }
+    result
+}
+
+/// Constant-time limb-wise addition: always iterates all `MAX_LIMBS` slots
+/// so the loop trip count does not depend on `a.len`/`b.len` (Issue #372).
 fn add(a: &Bignum, b: &Bignum) -> (Bignum, eth_u256) {
     let b0 = base();
-    let n = a.len.max(b.len);
     let mut out = Bignum::zero();
     let mut carry = eth_u256::ZERO;
-    for i in 0..n {
-        let ai = a.limbs.get(i).copied().unwrap_or(eth_u256::ZERO);
-        let bi = b.limbs.get(i).copied().unwrap_or(eth_u256::ZERO);
+    for i in 0..MAX_LIMBS {
+        let ai = ct_select_u256(i < a.len, a.limbs[i], eth_u256::ZERO);
+        let bi = ct_select_u256(i < b.len, b.limbs[i], eth_u256::ZERO);
         let sum = ai + bi + carry;
         carry = sum / b0;
         out.limbs[i] = sum % b0;
     }
-    out.len = n;
-    if carry != eth_u256::ZERO {
-        out.limbs[out.len] = carry;
-        out.len += 1;
-    }
+    let n = a.len.max(b.len);
+    let has_extra_carry = (carry != eth_u256::ZERO) as usize;
+    debug_assert!(
+        n + has_extra_carry <= MAX_LIMBS,
+        "Bignum::add overflow: result exceeds MAX_LIMBS"
+    );
+    out.len = (n + has_extra_carry).min(MAX_LIMBS);
     (out, carry)
 }
 
 /// `a - b`; caller must ensure `a >= b`.
 #[allow(dead_code)]
+/// Constant-time limb-wise subtraction (caller must ensure `a >= b`).
+/// Always iterates all `MAX_LIMBS` slots and selects the borrow branch via a
+/// branchless mask instead of a data-dependent `if` (Issue #372).
+#[allow(dead_code)]
 fn sub(a: &Bignum, b: &Bignum) -> Bignum {
     let b0 = base();
     let mut out = Bignum::zero();
-    let n = a.len.max(b.len);
     let mut borrow = eth_u256::ZERO;
-    for i in 0..n {
-        let ai = a.limbs.get(i).copied().unwrap_or(eth_u256::ZERO);
-        let bi = b.limbs.get(i).copied().unwrap_or(eth_u256::ZERO);
-        let mut t = ai + b0 - borrow - bi;
-        if t >= b0 {
-            out.limbs[i] = t - b0;
-            borrow = eth_u256::ZERO;
-        } else {
-            out.limbs[i] = t;
-            borrow = eth_u256::ONE;
-        }
+    for i in 0..MAX_LIMBS {
+        let ai = ct_select_u256(i < a.len, a.limbs[i], eth_u256::ZERO);
+        let bi = ct_select_u256(i < b.len, b.limbs[i], eth_u256::ZERO);
+        let t = ai + b0 - borrow - bi;
+        let need_borrow = (t >= b0) as u8;
+        let mask = eth_u256::ZERO.wrapping_sub(eth_u256::from(need_borrow));
+        out.limbs[i] = (t & !mask) | (t.wrapping_sub(b0) & mask);
+        borrow = eth_u256::from(need_borrow);
     }
-    out.len = n;
+    out.len = a.len.max(b.len);
     out.normalize();
     out
 }
@@ -174,21 +186,24 @@ fn mul(a: &Bignum, b: &Bignum) -> Bignum {
     out
 }
 
+/// Constant-time scalar multiplication: always iterates all `MAX_LIMBS`
+/// slots so the loop trip count does not depend on `a.len` (Issue #372).
 fn mul_scalar(a: &Bignum, d: eth_u256) -> Bignum {
     let b0 = base();
     let mut out = Bignum::zero();
     let mut carry = eth_u256::ZERO;
-    for i in 0..a.len {
-        let cur = a.limbs[i] * d + carry;
+    for i in 0..MAX_LIMBS {
+        let ai = ct_select_u256(i < a.len, a.limbs[i], eth_u256::ZERO);
+        let cur = ai * d + carry;
         out.limbs[i] = cur % b0;
         carry = cur / b0;
     }
-    if carry != eth_u256::ZERO {
-        out.limbs[a.len] = carry;
-        out.len = a.len + 1;
-    } else {
-        out.len = a.len;
-    }
+    let has_extra = (carry != eth_u256::ZERO) as usize;
+    debug_assert!(
+        a.len + has_extra <= MAX_LIMBS,
+        "Bignum::mul_scalar overflow: result exceeds MAX_LIMBS"
+    );
+    out.len = (a.len + has_extra).min(MAX_LIMBS);
     out.normalize();
     out
 }
@@ -306,10 +321,17 @@ impl Bignum {
         out
     }
 
+    /// Constant-time-oriented normalization: scans all `MAX_LIMBS` slots
+    /// instead of an early-exit `while` loop, so the number of iterations
+    /// does not depend on how many leading limbs happen to be zero (Issue #372).
     fn normalize(&mut self) {
-        while self.len > 1 && self.limbs[self.len - 1] == eth_u256::ZERO {
-            self.len -= 1;
+        let mut new_len = 1usize;
+        for i in 1..MAX_LIMBS {
+            let is_nonzero = (self.limbs[i] != eth_u256::ZERO) as usize;
+            let candidate = (i + 1) * is_nonzero;
+            new_len = new_len.max(candidate);
         }
+        self.len = new_len;
     }
 }
 
