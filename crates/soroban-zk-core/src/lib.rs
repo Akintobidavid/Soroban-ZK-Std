@@ -371,6 +371,9 @@ pub enum ZkError {
     /// not be translated into a successful result. The host function may be
     /// unavailable (e.g. local off-chain test environment) or rejected the input.
     HostError,
+    /// A storage operation (read/write/remove) failed or required data was
+    /// missing from the Soroban ledger.
+    StorageError,
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.
