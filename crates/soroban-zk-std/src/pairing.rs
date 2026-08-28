@@ -1,9 +1,5 @@
 use ethnum::u256;
-use soroban_sdk::crypto::bn254::{Bn254G1Affine as SdkG1Affine, Bn254G2Affine as SdkG2Affine};
-use soroban_sdk::BytesN;
-use soroban_sdk::Env;
-use soroban_sdk::Vec;
-use soroban_zk_core::{Bn254, G1Affine, ZkError};
+use soroban_zk_core::{Bn254, G1Affine};
 
 /// A BN254 G2 point in affine coordinates (X, Y).
 /// Coordinates are elements of the degree-2 extension field Fq²,
@@ -76,13 +72,13 @@ pub(crate) fn g1_to_bytes(g1: &G1Affine) -> [u8; 64] {
     bytes
 }
 
-fn validate_g2_coords(g2: &G2Affine) -> bool {
+pub(crate) fn validate_g2_coords(g2: &G2Affine) -> bool {
     let (x0, x1) = g2.x;
     let (y0, y1) = g2.y;
-    Bn254::is_valid_fq(x0)
-        && Bn254::is_valid_fq(x1)
-        && Bn254::is_valid_fq(y0)
-        && Bn254::is_valid_fq(y1)
+
+    // is_on_curve also enforces field-element membership of the coordinates.
+    Bn254::is_on_curve((x0, x1), (y0, y1))
+        && Bn254::is_in_correct_subgroup((x0, x1), (y0, y1))
 }
 
 /// Validates that a G2 point is both on the BN254 curve and in the prime-order subgroup.
@@ -90,7 +86,7 @@ fn validate_g2_coords(g2: &G2Affine) -> bool {
 /// This function performs two essential security checks:
 /// 
 /// 1. **Curve membership (on-curve check):** Verifies that the point (x, y) satisfies
-///    the BN254 G2 curve equation: y² = x³ + β over Fq², where β = 3 + 19*u.
+///    the BN254 G2 curve equation: y² = x³ + β over Fq², where β = 3/(u + 9).
 ///    
 ///    **Why this matters:** Without this check, a malicious prover could submit
 ///    a point with valid field-element coordinates that does NOT lie on the curve.
@@ -115,58 +111,20 @@ fn validate_g2_coords(g2: &G2Affine) -> bool {
 /// - Returns `true` for the identity element (point at infinity) if it is
 ///   properly encoded, but currently (0, 0) fails the affine check.
 /// 
-/// References:
-/// - BN254 parameters: https://neuromancer.sk/std/bn/bn254
-/// - Subgroup attacks: https://eprint.iacr.org/2024/1099
-fn validate_g2_full(g2: &G2Affine) -> bool {
-    let (x0, x1) = g2.x;
-    let (y0, y1) = g2.y;
-    
-    // First, verify field membership (prerequisite)
-    if !Bn254::is_valid_fq(x0) || !Bn254::is_valid_fq(x1)
-        || !Bn254::is_valid_fq(y0) || !Bn254::is_valid_fq(y1)
-    {
-        return false;
-    }
-
-    // Check curve membership: y² = x³ + β
-    if !Bn254::is_valid_g2_curve((x0, x1), (y0, y1)) {
-        return false;
-    }
-
-    // Check subgroup membership: [r]Q = ∞
-    Bn254::is_valid_g2_subgroup((x0, x1), (y0, y1))
-}
-
-/// Evaluates the BN254 pairing check e(A1, B1) * ... * e(An, Bn) == 1.
-pub fn pairing_check(env: &Env, pairs: &[(G1Affine, G2Affine)]) -> Result<bool, ZkError> {
-    if pairs.is_empty() {
-        return Err(ZkError::InvalidInput);
-    }
-
-    let mut vp1: Vec<SdkG1Affine> = Vec::new(env);
-    let mut vp2: Vec<SdkG2Affine> = Vec::new(env);
-
-    for (g1, g2) in pairs {
-        if !Bn254::is_valid_g1_subgroup(g1.x, g1.y) || !validate_g2_full(g2) {
-            return Err(ZkError::InvalidInput);
-        }
-
-        let sdk_g1 = SdkG1Affine::from_bytes(BytesN::from_array(env, &g1_to_bytes(g1)));
-        let sdk_g2 = SdkG2Affine::from_bytes(BytesN::from_array(env, &g2.to_bytes()));
-
-        vp1.push_back(sdk_g1);
-        vp2.push_back(sdk_g2);
-    }
-
-    Ok(env.crypto().bn254().pairing_check(vp1, vp2))
-}
+/// Evaluates the BN254 pairing check `e(A₁, B₁) · … · e(Aₙ, Bₙ) == 1`.
+///
+/// This delegates to the CAP-0075 host translation layer in [`crate::host`],
+/// which performs strict input validation, invokes the native
+/// `bn254_multi_pairing_check` host function, and transparently falls back to a
+/// software pairing when the host is unavailable (off-chain tests).
+pub use crate::host::pairing_check;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ethnum::u256;
     use soroban_sdk::Env;
+    use soroban_zk_core::ZkError;
 
     fn g1_generator() -> G1Affine {
         G1Affine {
