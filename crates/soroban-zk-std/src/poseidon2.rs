@@ -38,22 +38,38 @@ fn u(env: &Env, hi: u128, lo: u128) -> U256 {
     U256::from_be_bytes(env, &Bytes::from_array(env, &b))
 }
 
-/// Field addition mod r: (a + b) mod r.
-/// Both inputs must be < r. The modulus is passed in so callers can reuse a
-/// cached value instead of rebuilding it on every addition.
-fn field_add(a: &U256, b: &U256, modulus: &U256) -> U256 {
-    // Soroban U256 addition can panic if the sum exceeds the 256-bit range.
-    // Reduce each operand modulo the field modulus first, then add the reduced
-    // values. Since each operand is now < modulus, their sum is always safe.
-    let a_mod = if a >= modulus { a.sub(modulus) } else { a.clone() };
-    let b_mod = if b >= modulus { b.sub(modulus) } else { b.clone() };
+/// Field addition mod r: `(a + b) mod r`.
+///
+/// Performed entirely in `ethnum::u256` space. Both operands are reduced
+/// modulo the field modulus *before* the addition, so each is `< r` and their
+/// sum is bounded by `2·r < 2^256` — meaning the `ethnum` addition can never
+/// overflow the 256-bit range and will never trigger a host panic. The result
+/// is reduced once more so it always lies in `[0, r)`.
+///
+/// The modulus is passed in so callers can reuse a cached value instead of
+/// rebuilding it on every addition.
+fn field_add(env: &Env, a: &U256, b: &U256, modulus: &U256) -> U256 {
+    let mut mb = [0u8; 32];
+    modulus.to_be_bytes().copy_into_slice(&mut mb);
+    let mv = eth_u256::from_be_bytes(mb);
 
-    let sum = a_mod.add(&b_mod);
-    if sum >= *modulus {
-        sum.sub(modulus)
-    } else {
-        sum
-    }
+    // Fully reduce each operand modulo the field modulus.
+    let mut ab = [0u8; 32];
+    a.to_be_bytes().copy_into_slice(&mut ab);
+    let av = eth_u256::from_be_bytes(ab) % mv;
+
+    let mut bb = [0u8; 32];
+    b.to_be_bytes().copy_into_slice(&mut bb);
+    let bv = eth_u256::from_be_bytes(bb) % mv;
+
+    // Each reduced operand is < mv (≈ 2^254), so their sum is < 2·mv < 2^256
+    // and the addition is always in-range (no host panic).
+    let sum = av + bv;
+
+    // Final modular reduction: since sum < 2·mv, a single subtraction suffices.
+    let reduced = if sum >= mv { sum - mv } else { sum };
+
+    U256::from_be_bytes(env, &Bytes::from_array(env, &reduced.to_be_bytes()))
 }
 
 fn fr_to_u256(env: &Env, input: Fr) -> U256 {
@@ -589,7 +605,7 @@ impl Poseidon2Sponge {
     pub fn absorb(&mut self, inputs: &[U256]) {
         for input in inputs {
             let cur = self.state.get(self.rate_idx).unwrap();
-            let next = field_add(&cur, input, &self.modulus);
+            let next = field_add(&self.env, &cur, input, &self.modulus);
             self.state.set(self.rate_idx, next);
             self.rate_idx += 1;
             if self.rate_idx == RATE {
@@ -746,9 +762,50 @@ mod tests {
         let a = modulus.clone().sub(&U256::from_u128(&env, 1));
         let b = U256::from_u128(&env, 2);
 
-        let result = field_add(&a, &b, &modulus);
+        let result = field_add(&env, &a, &b, &modulus);
 
         assert_eq!(result, U256::from_u128(&env, 1));
+    }
+
+    #[test]
+    fn field_add_no_panic_on_max_boundary_values() {
+        let env = env();
+        let modulus = fr_modulus(&env);
+
+        // Deliberately near the 2^256 boundary: a = U256::MAX - 1,
+        // b = U256::MAX - 2. Their naive sum exceeds 2^256, which previously
+        // panicked the host via a direct `.add()`.
+        let max = U256::from_be_bytes(
+            &env,
+            &Bytes::from_array(&env, &[0xffu8; 32]),
+        );
+        let a = max.sub(&U256::from_u128(&env, 1));
+        let b = max.sub(&U256::from_u128(&env, 2));
+
+        // Must not panic and must return a properly reduced field element.
+        let result = field_add(&env, &a, &b, &modulus);
+
+        // Cross-check the expected value in ethnum space (reduce each operand
+        // first so the addition is in-range, exactly as field_add does).
+        let mut mb = [0u8; 32];
+        modulus.to_be_bytes().copy_into_slice(&mut mb);
+        let mv = eth_u256::from_be_bytes(mb);
+        let max_eth = eth_u256::from_be_bytes([0xffu8; 32]);
+        let av = (max_eth - eth_u256::from(1u8)) % mv;
+        let bv = (max_eth - eth_u256::from(2u8)) % mv;
+        let expected_eth = av + bv;
+        let expected_eth = if expected_eth >= mv {
+            expected_eth - mv
+        } else {
+            expected_eth
+        };
+        let expected = U256::from_be_bytes(
+            &env,
+            &Bytes::from_array(&env, &expected_eth.to_be_bytes()),
+        );
+
+        assert_eq!(result, expected);
+        assert!(result < modulus);
     }
 
     #[test]
