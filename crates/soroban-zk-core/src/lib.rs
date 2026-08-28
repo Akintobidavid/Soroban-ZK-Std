@@ -367,6 +367,12 @@ pub enum ZkError {
     InvalidInput,
     /// Serialized proof or point bytes could not be decoded into a valid structure.
     DeserializationError,
+    /// A Merkle authentication path did not recompute to the claimed root.
+    MerkleVerificationFailed,
+    /// A FRI layer failed its degree/proximity or folding-consistency check.
+    FriInvalid,
+    /// A boundary or transition constraint over the execution trace was violated.
+    BoundaryConstraintFailed,
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.

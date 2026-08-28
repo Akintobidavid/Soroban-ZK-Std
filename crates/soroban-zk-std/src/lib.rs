@@ -3,6 +3,7 @@ pub mod cache;
 pub mod groth16;
 pub mod pairing;
 pub mod poseidon2;
+pub mod stark;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 pub use pairing::{pairing_check, G2Affine};
