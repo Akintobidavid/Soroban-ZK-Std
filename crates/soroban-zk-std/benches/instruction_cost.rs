@@ -109,6 +109,57 @@ fn bench_fr_mul() {
     check_cost(cost, "Fr::mul");
 }
 
+/// Before/after comparison for issue #360: the Montgomery multiplication engine
+/// (`Bn254::mul`) versus the pre-optimization reference (`Bn254::mul_mod_legacy`).
+///
+/// Reports the per-multiplication CPU instruction cost of each and the
+/// speed-up factor. Running this on a release WASM build demonstrates the
+/// instruction-footprint reduction that keeps ZK proof verification inside the
+/// Soroban transaction budget.
+#[test]
+fn bench_fr_mul_montgomery_vs_legacy() {
+    let a = u256::from(0x1234567890abcdefu64);
+    let b = u256::from(0xfedcba0987654321u64);
+
+    // Montgomery engine (new).
+    let env = setup_env();
+    let start = env.cost_estimate().budget().cpu_instruction_cost();
+    for _ in 0..1000 {
+        std::mem::forget(Bn254::mul(a, b));
+    }
+    let montgomery_cost = (env.cost_estimate().budget().cpu_instruction_cost() - start) / 1000;
+
+    // Reference shift-and-add / Karatsuba path (old).
+    let env = setup_env();
+    let start = env.cost_estimate().budget().cpu_instruction_cost();
+    for _ in 0..1000 {
+        std::mem::forget(Bn254::mul_mod_legacy(a, b));
+    }
+    let legacy_cost = (env.cost_estimate().budget().cpu_instruction_cost() - start) / 1000;
+
+    std::println!(
+        "Fr::mul (Montgomery): {} instructions/mul",
+        montgomery_cost
+    );
+    std::println!(
+        "Fr::mul_mod_legacy:   {} instructions/mul",
+        legacy_cost
+    );
+    let speedup = legacy_cost as f64 / montgomery_cost.max(1) as f64;
+    std::println!("Montgomery speed-up factor: {:.2}x", speedup);
+
+    // Both must agree numerically (the optimization must preserve semantics).
+    assert_eq!(Bn254::mul(a, b), Bn254::mul_mod_legacy(a, b));
+
+    // The new path must be strictly cheaper per multiplication.
+    assert!(
+        montgomery_cost < legacy_cost,
+        "Montgomery mul ({}) was not cheaper than legacy ({})",
+        montgomery_cost,
+        legacy_cost
+    );
+}
+
 #[test]
 fn bench_fr_invert() {
     let a = u256::from(100u32);

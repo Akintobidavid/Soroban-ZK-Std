@@ -19,3 +19,7 @@ proptest = "1"
 [[bench]]
 name = "g1_ops"
 harness = false
+
+[[bench]]
+name = "montgomery_ops"
+harness = false
