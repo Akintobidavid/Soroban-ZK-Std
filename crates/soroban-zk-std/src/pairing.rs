@@ -76,13 +76,27 @@ pub(crate) fn g1_to_bytes(g1: &G1Affine) -> [u8; 64] {
     bytes
 }
 
-fn validate_g2_coords(g2: &G2Affine) -> bool {
+/// Validates that a G2 point is both on the BN254 curve and in the prime-order subgroup.
+///
+/// This performs two essential security checks:
+///
+/// 1. **Curve membership (on-curve check):** verifies `(x, y)` satisfies the BN254
+///    G2 curve equation `y² = x³ + β` over Fq² (β = 3/(u + 9)). Without this, a
+///    malicious prover could submit an invalid-curve point that bypasses soundness.
+///
+/// 2. **Subgroup membership (order check):** verifies the point belongs to the
+///    prime-order subgroup G₂ of order `r` via `[r]·Q = ∞`. Without this, a
+///    small-subgroup / cofactor attack leaks the prover's witness through the
+///    pairing map.
+///
+/// Returns `true` only if both checks pass.
+pub(crate) fn validate_g2_coords(g2: &G2Affine) -> bool {
     let (x0, x1) = g2.x;
     let (y0, y1) = g2.y;
-    Bn254::is_valid_fq(x0)
-        && Bn254::is_valid_fq(x1)
-        && Bn254::is_valid_fq(y0)
-        && Bn254::is_valid_fq(y1)
+
+    // is_on_curve also enforces field-element membership of the coordinates.
+    Bn254::is_on_curve((x0, x1), (y0, y1))
+        && Bn254::is_in_correct_subgroup((x0, x1), (y0, y1))
 }
 
 /// Validates that a G2 point is both on the BN254 curve and in the prime-order subgroup.
@@ -90,7 +104,7 @@ fn validate_g2_coords(g2: &G2Affine) -> bool {
 /// This function performs two essential security checks:
 /// 
 /// 1. **Curve membership (on-curve check):** Verifies that the point (x, y) satisfies
-///    the BN254 G2 curve equation: y² = x³ + β over Fq², where β = 3 + 19*u.
+///    the BN254 G2 curve equation: y² = x³ + β over Fq², where β = 3/(u + 9).
 ///    
 ///    **Why this matters:** Without this check, a malicious prover could submit
 ///    a point with valid field-element coordinates that does NOT lie on the curve.
@@ -119,23 +133,7 @@ fn validate_g2_coords(g2: &G2Affine) -> bool {
 /// - BN254 parameters: https://neuromancer.sk/std/bn/bn254
 /// - Subgroup attacks: https://eprint.iacr.org/2024/1099
 fn validate_g2_full(g2: &G2Affine) -> bool {
-    let (x0, x1) = g2.x;
-    let (y0, y1) = g2.y;
-    
-    // First, verify field membership (prerequisite)
-    if !Bn254::is_valid_fq(x0) || !Bn254::is_valid_fq(x1)
-        || !Bn254::is_valid_fq(y0) || !Bn254::is_valid_fq(y1)
-    {
-        return false;
-    }
-
-    // Check curve membership: y² = x³ + β
-    if !Bn254::is_valid_g2_curve((x0, x1), (y0, y1)) {
-        return false;
-    }
-
-    // Check subgroup membership: [r]Q = ∞
-    Bn254::is_valid_g2_subgroup((x0, x1), (y0, y1))
+    validate_g2_coords(g2)
 }
 
 /// Evaluates the BN254 pairing check e(A1, B1) * ... * e(An, Bn) == 1.

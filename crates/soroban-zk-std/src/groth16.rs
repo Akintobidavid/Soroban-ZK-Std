@@ -3,7 +3,7 @@ use soroban_sdk::crypto::bn254::{Bn254Fr as SdkFr, Bn254G1Affine as SdkG1Affine}
 use soroban_sdk::{Bytes, BytesN, Env, Vec, U256};
 use soroban_zk_core::{Bn254, G1Affine, ZkError};
 
-use crate::pairing::{g1_to_bytes, pairing_check, G2Affine};
+use crate::pairing::{g1_to_bytes, pairing_check, validate_g2_coords, G2Affine};
 
 /// A Groth16 proof over BN254.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -117,13 +117,10 @@ fn g2_from_bytes(bytes: &[u8]) -> Result<G2Affine, ZkError> {
         y: (y0, y1),
     };
 
-    // Validate that the deserialized G2 point is on the curve and in the subgroup.
-    // This ensures that untrusted proof data cannot contain invalid G2 elements.
-    if !Bn254::is_valid_g2_curve((x0, x1), (y0, y1)) {
-        return Err(ZkError::DeserializationError);
-    }
-
-    if !Bn254::is_valid_g2_subgroup((x0, x1), (y0, y1)) {
+    // Validate that the deserialized G2 point is on the curve AND in the prime-order
+    // subgroup. This ensures that untrusted proof data cannot contain invalid-curve
+    // or small-subgroup G2 elements that would otherwise break proof soundness.
+    if !validate_g2_coords(&g2) {
         return Err(ZkError::DeserializationError);
     }
 
@@ -444,5 +441,94 @@ mod tests {
                 .unwrap(),
             ),
         }
+    }
+
+    /// Computes a square root of an Fq² element `(a0, a1)` using the identity
+    /// `(x + y·u)² = (x² - y², 2xy)`. Returns `None` if `a` is not a quadratic
+    /// residue in Fq².
+    fn fq2_sqrt(a: (u256, u256)) -> Option<(u256, u256)> {
+        let norm = Bn254::add_fq(Bn254::mul_fq(a.0, a.0), Bn254::mul_fq(a.1, a.1));
+        let alpha = Bn254::sqrt_fq(norm);
+        if Bn254::mul_fq(alpha, alpha) != norm {
+            return None;
+        }
+        let inv2 = Bn254::invert_fq(u256::from(2u8));
+        let x2 = Bn254::mul_fq(Bn254::add_fq(alpha, a.0), inv2);
+        let y2 = Bn254::mul_fq(Bn254::sub_fq(alpha, a.0), inv2);
+        let x = Bn254::sqrt_fq(x2);
+        if Bn254::mul_fq(x, x) != x2 {
+            return None;
+        }
+        let mut y = Bn254::sqrt_fq(y2);
+        if Bn254::mul_fq(y, y) != y2 {
+            return None;
+        }
+        // Fix the sign of y so that 2xy == a.1 (the imaginary part constraint).
+        if Bn254::mul_fq(Bn254::add_fq(x, x), y) != a.1 {
+            y = Bn254::sub_fq(u256::from(0u8), y);
+        }
+        if Bn254::fq2_sq((x, y)) != a {
+            return None;
+        }
+        Some((x, y))
+    }
+
+    /// Finds a G2 point that is on the curve `y² = x³ + β` but is NOT in the
+    /// prime-order subgroup (i.e. `[r]·Q ≠ ∞`). With overwhelming probability a
+    /// random on-curve point has full group order `r·h₂`, so the first on-curve
+    /// point we find is off-subgroup.
+    fn g2_off_subgroup_point() -> G2Affine {
+        let beta = (Bn254::G2_B_REAL, Bn254::G2_B_IMAG);
+        let mut x_re = u256::from(1u8);
+        loop {
+            let x = (x_re, u256::from(0u8));
+            let x2 = Bn254::fq2_sq(x);
+            let x3 = Bn254::fq2_mul(x2, x);
+            let rhs = Bn254::fq2_add(x3, beta);
+            if let Some(y) = fq2_sqrt(rhs) {
+                if !Bn254::is_in_correct_subgroup(x, y) {
+                    return G2Affine { x, y };
+                }
+            }
+            x_re = Bn254::add_fq(x_re, u256::from(1u8));
+        }
+    }
+
+    #[test]
+    fn test_g2_from_bytes_accepts_valid_generator() {
+        let g2 = g2_generator();
+        let bytes = g2.to_bytes();
+        assert_eq!(g2_from_bytes(&bytes), Ok(g2), "valid G2 generator should parse");
+    }
+
+    #[test]
+    fn test_g2_from_bytes_rejects_off_curve_point() {
+        // Take a valid on-curve point and perturb its y-coordinate so it no longer
+        // satisfies y² = x³ + β.
+        let mut bad = g2_generator();
+        bad.y.0 = Bn254::add_fq(bad.y.0, u256::from(1u8));
+
+        let bytes = bad.to_bytes();
+        assert_eq!(
+            g2_from_bytes(&bytes),
+            Err(ZkError::DeserializationError),
+            "g2_from_bytes must reject an off-curve G2 point"
+        );
+    }
+
+    #[test]
+    fn test_g2_from_bytes_rejects_invalid_subgroup_point() {
+        // Feed a point that is on the curve but NOT in the prime-order subgroup.
+        let off_subgroup = g2_off_subgroup_point();
+        // Sanity: it really is on the curve but not in the subgroup.
+        assert!(Bn254::is_on_curve(off_subgroup.x, off_subgroup.y));
+        assert!(!Bn254::is_in_correct_subgroup(off_subgroup.x, off_subgroup.y));
+
+        let bytes = off_subgroup.to_bytes();
+        assert_eq!(
+            g2_from_bytes(&bytes),
+            Err(ZkError::DeserializationError),
+            "g2_from_bytes must reject a G2 point outside the prime-order subgroup"
+        );
     }
 }
