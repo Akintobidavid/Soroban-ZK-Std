@@ -1,6 +1,7 @@
 #![no_std]
 pub mod cache;
 pub mod groth16;
+pub mod host;
 pub mod pairing;
 pub mod poseidon2;
 

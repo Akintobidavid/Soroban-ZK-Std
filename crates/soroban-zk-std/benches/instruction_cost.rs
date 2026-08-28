@@ -223,3 +223,43 @@ fn bench_groth16_verify() {
         cost
     );
 }
+
+/// Measures the instruction cost of a native CAP-0075 `bn254_multi_pairing_check`
+/// call (via [`pairing_check`]) for a given number of pairs. Each pair is a
+/// structurally valid `(G1, G2)` so the host path is fully exercised.
+fn mock_pairing_check(n: usize) -> u64 {
+    let g1 = g1_generator();
+    let neg_g1 = g1_generator_neg();
+    let g2 = g2_generator();
+
+    let mut pairs: std::vec::Vec<(G1Affine, G2Affine)> = std::vec::Vec::new();
+    for i in 0..n {
+        let g1pt = if i % 2 == 0 { g1 } else { neg_g1 };
+        pairs.push((g1pt, g2));
+    }
+
+    let env = setup_env();
+    let start = env.cost_estimate().budget().cpu_instruction_cost();
+    let _ = pairing_check(&env, &pairs);
+    env.cost_estimate().budget().cpu_instruction_cost() - start
+}
+
+#[test]
+fn bench_pairing_check() {
+    // Tracks total + per-pair marginal cost to document the asymptotic behavior
+    // of the native pairing host function.
+    let mut prev: Option<u64> = None;
+    for n in [1usize, 2, 4, 8] {
+        let cost = mock_pairing_check(n);
+        match prev {
+            Some(p) if n > 1 => {
+                let per_pair = cost.saturating_sub(p) / ((n / 2) as u64);
+                std::println!("pairing_check_{}: {} instructions (≈{} per extra pair)",
+                    n, cost, per_pair);
+            }
+            _ => std::println!("pairing_check_{}: {} instructions", n, cost),
+        }
+        check_cost(cost, &format!("pairing_check_{}", n));
+        prev = Some(cost);
+    }
+}
