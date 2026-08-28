@@ -82,7 +82,7 @@ pub fn groth16_verify(
     )
 }
 
-fn g1_from_bytes(bytes: &[u8]) -> Result<G1Affine, ZkError> {
+pub(crate) fn g1_from_bytes(bytes: &[u8]) -> Result<G1Affine, ZkError> {
     if bytes.len() != 64 {
         return Err(ZkError::DeserializationError);
     }
@@ -102,7 +102,7 @@ fn g1_from_bytes(bytes: &[u8]) -> Result<G1Affine, ZkError> {
     Ok(G1Affine { x, y })
 }
 
-fn g2_from_bytes(bytes: &[u8]) -> Result<G2Affine, ZkError> {
+pub(crate) fn g2_from_bytes(bytes: &[u8]) -> Result<G2Affine, ZkError> {
     if bytes.len() != 128 {
         return Err(ZkError::DeserializationError);
     }

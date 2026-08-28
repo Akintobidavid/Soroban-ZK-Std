@@ -18,7 +18,20 @@
 //! cache miss (for example after TTL expiry) is recovered transparently with
 //! no loss of correctness.
 
-use soroban_sdk::{contracttype, Env, Vec, U256};
+use soroban_sdk::{contracttype, Bytes, Env, Vec, U256};
+use soroban_zk_core::G1Affine;
+
+/// Copy a `Bytes` value into a fixed-size byte array for decoding.
+fn bytes_to_array<const N: usize>(b: &Bytes) -> [u8; N] {
+    let mut arr = [0u8; N];
+    for (i, byte) in b.iter().take(N).enumerate() {
+        arr[i] = byte;
+    }
+    arr
+}
+
+use crate::groth16::{g1_from_bytes, g2_from_bytes};
+use crate::pairing::{g1_to_bytes, G2Affine};
 
 /// Lower TTL bound (in ledgers) for the instance entry. When the remaining
 /// time-to-live drops below this threshold, the entry is extended back up to
@@ -39,6 +52,10 @@ pub enum ConstantKey {
     Poseidon2MatDiag,
     /// BN254 Fr field modulus r.
     FrModulus,
+    /// Canonical BN254 G1 generator point (1, 2).
+    G1Generator,
+    /// Canonical BN254 G2 generator point.
+    G2Generator,
 }
 
 /// Bump the instance TTL so the cached constants stay live during active use.
@@ -96,6 +113,50 @@ pub fn fr_modulus(env: &Env) -> U256 {
     value
 }
 
+/// Return the cached canonical BN254 G1 generator, computing and storing it on
+/// the first call within the contract.
+///
+/// ## Collision safety
+/// The generator is stored under the `#[contracttype]` key `ConstantKey::G1Generator`.
+/// Because `contracttype` keys are XDR-encoded with a type discriminant, this
+/// key is distinct from any plain `Symbol`/`String` key an external dApp might
+/// write to its own instance storage. A foreign entry therefore cannot
+/// overwrite — or be clobbered by — the cached generator.
+pub fn g1_generator(env: &Env) -> G1Affine {
+    let store = env.storage().instance();
+    let value = match store.get::<ConstantKey, soroban_sdk::Bytes>(&ConstantKey::G1Generator) {
+        Some(b) => {
+            // Cached bytes are ours; if decoding ever fails we recompute.
+            g1_from_bytes(&bytes_to_array::<64>(&b))
+                .unwrap_or(crate::vk::G1_GENERATOR)
+        }
+        None => {
+            let b = soroban_sdk::Bytes::from_array(env, &g1_to_bytes(&crate::vk::G1_GENERATOR));
+            store.set(&ConstantKey::G1Generator, &b);
+            crate::vk::G1_GENERATOR
+        }
+    };
+    bump(env);
+    value
+}
+
+/// Return the cached canonical BN254 G2 generator, computing and storing it on
+/// the first call within the contract. See [`g1_generator`] for the collision
+/// safety rationale.
+pub fn g2_generator(env: &Env) -> G2Affine {
+    let store = env.storage().instance();
+    let value = match store.get::<ConstantKey, soroban_sdk::Bytes>(&ConstantKey::G2Generator) {
+        Some(b) => g2_from_bytes(&bytes_to_array::<128>(&b)).unwrap_or(crate::vk::G2_GENERATOR),
+        None => {
+            let b = soroban_sdk::Bytes::from_array(env, &crate::vk::G2_GENERATOR.to_bytes());
+            store.set(&ConstantKey::G2Generator, &b);
+            crate::vk::G2_GENERATOR
+        }
+    };
+    bump(env);
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +200,34 @@ mod tests {
             let store = env.storage().instance();
             assert!(store.has(&ConstantKey::Poseidon2MatDiag));
             assert!(store.has(&ConstantKey::FrModulus));
+        });
+    }
+
+    #[test]
+    fn generator_cache_isolated_from_external_keys() {
+        let env = env();
+        let id = env.register(ZkContract, ());
+        env.as_contract(&id, || {
+            // Populate the cached generator.
+            assert_eq!(g1_generator(&env), crate::vk::G1_GENERATOR);
+            assert_eq!(g2_generator(&env), crate::vk::G2_GENERATOR);
+
+            // An external dApp writes an unrelated value under a `Symbol` key
+            // that happens to share the human-readable name "G1Generator".
+            let foreign = soroban_sdk::Symbol::new(&env, "G1Generator");
+            env.storage()
+                .instance()
+                .set(&foreign, &soroban_sdk::Bytes::from_array(&env, &[9u8; 32]));
+
+            // Our cached generator read is unaffected and still correct.
+            assert_eq!(g1_generator(&env), crate::vk::G1_GENERATOR);
+            assert_eq!(g2_generator(&env), crate::vk::G2_GENERATOR);
+            // The foreign entry remains distinct and untouched.
+            assert!(env.storage().instance().has(&foreign));
+            assert!(env
+                .storage()
+                .instance()
+                .has(&ConstantKey::G1Generator));
         });
     }
 }
