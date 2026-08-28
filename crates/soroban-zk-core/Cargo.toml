@@ -15,6 +15,13 @@ itertools = { version = "0.15.0", default-features = false }
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+# Trusted reference library used for differential testing (Phase 2). Pinned to
+# the same arkworks 0.6 line already used by soroban-zk-std so the lockfile
+# resolution stays unified. `std` is enabled because these are only ever
+# compiled for host-side tests/benches, never for the no_std target.
+ark-bn254 = { version = "0.6.0", default-features = false, features = ["curve", "std"] }
+ark-ff = { version = "0.6.0", default-features = false, features = ["std"] }
+ark-ec = { version = "0.6.0", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "g1_ops"
