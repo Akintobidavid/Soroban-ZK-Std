@@ -1,6 +1,7 @@
 #![no_std]
 use ethnum::u256;
 
+pub mod bulletproofs;
 pub mod elgamal {
     use super::*;
 
