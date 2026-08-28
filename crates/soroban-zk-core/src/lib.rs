@@ -43,7 +43,7 @@ pub mod elgamal {
             ephemeral: u256,
         ) -> Result<Self, ZkError> {
             // Validate amount is in the scalar field
-            if amount >= Bn254::BASE_MODULUS {
+            if amount >= Bn254::FR_MODULUS {
                 return Err(ZkError::InvalidFieldElement);
             }
 
@@ -238,7 +238,7 @@ pub mod elgamal {
         #[test]
         fn encrypt_with_max_scalar_amount() {
             // Fr modulus - 1 is the largest valid scalar
-            let amount = Bn254::BASE_MODULUS - u256::from(1u8);
+            let amount = Bn254::FR_MODULUS - u256::from(1u8);
             let sk = u256::from(7u8);
             let ephemeral = u256::from(13u8);
             let pk = derive_pub_key(sk);
@@ -256,7 +256,7 @@ pub mod elgamal {
 
         #[test]
         fn encrypt_rejects_amount_above_modulus() {
-            let amount = Bn254::BASE_MODULUS; // exactly the modulus — invalid
+            let amount = Bn254::FR_MODULUS; // exactly the modulus — invalid
             let pk = derive_pub_key(u256::from(7u8));
 
             let result = ElGamalCiphertext::encrypt(amount, &pk, u256::from(13u8));
@@ -265,7 +265,7 @@ pub mod elgamal {
 
         #[test]
         fn encrypt_rejects_amount_well_above_modulus() {
-            let amount = Bn254::BASE_MODULUS + u256::from(1000u16);
+            let amount = Bn254::FR_MODULUS + u256::from(1000u16);
             let pk = derive_pub_key(u256::from(7u8));
 
             let result = ElGamalCiphertext::encrypt(amount, &pk, u256::from(13u8));
@@ -455,12 +455,48 @@ pub trait SafeFrom<T>: Sized {
 impl SafeFrom<u256> for Fr {
     #[inline(always)]
     fn safe_from(val: u256) -> Result<Self, ZkError> {
-        let (_, in_field) = val.overflowing_sub(Bn254::BASE_MODULUS);
+        // Constant-time check: val < Bn254::FR_MODULUS.
+        //
+        // `overflowing_sub` underflows (wraps, overflow == true) exactly when
+        // val < FR_MODULUS, i.e. when val is a valid scalar field element.
+        // This must check the *scalar* field modulus (r), not the base field
+        // modulus (q, `FQ_MODULUS`) — q > r, so checking against q would let
+        // out-of-range scalars in [r, q) pass as valid Fr elements.
+        let (_, in_field) = val.overflowing_sub(Bn254::FR_MODULUS);
         if in_field {
             Ok(Fr(val))
         } else {
             Err(ZkError::InvalidFieldElement)
         }
+    }
+}
+
+#[cfg(test)]
+mod fr_safe_from_tests {
+    use super::*;
+
+    #[test]
+    fn safe_from_max_valid_scalar_succeeds() {
+        // FR_MODULUS - 1 is the largest valid Fr element.
+        let val = Bn254::FR_MODULUS - u256::from(1u8);
+        let fr = Fr::safe_from(val).expect("FR_MODULUS - 1 should be a valid Fr element");
+        assert_eq!(fr.inner(), val);
+    }
+
+    #[test]
+    fn safe_from_rejects_scalar_modulus() {
+        // FR_MODULUS itself is out of range: valid elements are [0, r).
+        let result = Fr::safe_from(Bn254::FR_MODULUS);
+        assert_eq!(result, Err(ZkError::InvalidFieldElement));
+    }
+
+    #[test]
+    fn safe_from_rejects_base_field_modulus_minus_one() {
+        // FQ_MODULUS - 1 lies in [r, q), which must never be accepted as a
+        // scalar: this is exactly the malleability gap the base-vs-scalar
+        // modulus mixup would have permitted.
+        let result = Fr::safe_from(Bn254::FQ_MODULUS - u256::from(1u8));
+        assert_eq!(result, Err(ZkError::InvalidFieldElement));
     }
 }
 
@@ -484,11 +520,17 @@ pub struct JacobianPoint {
 }
 
 impl Bn254 {
+    /// Deprecated alias for [`Self::FR_MODULUS`].
+    ///
+    /// This name is ambiguous ("base" modulus, when it actually holds the
+    /// *scalar* field modulus r) and was previously defined as a separate
+    /// constant, which allowed it to silently drift out of sync with
+    /// `FR_MODULUS`/`FQ_MODULUS` — the root cause of the Fr validation bug
+    /// this alias now prevents by construction. Prefer [`Self::FR_MODULUS`]
+    /// (scalar field) or [`Self::FQ_MODULUS`] (base field) directly.
+    #[deprecated(note = "use Bn254::FR_MODULUS instead; this name is ambiguous with FQ_MODULUS")]
+    pub const BASE_MODULUS: ethnum::u256 = Self::FR_MODULUS;
     /// BN254 scalar field modulus r (order of G1/G2).
-    pub const BASE_MODULUS: ethnum::u256 = ethnum::u256::from_words(
-        0x30644e72e131a029b85045b68181585d_u128,
-        0x2833e84879b9709143e1f593f0000001_u128,
-    );
     pub const FR_MODULUS: ethnum::u256 = ethnum::u256::from_words(
         0x30644e72e131a029b85045b68181585d_u128,
         0x2833e84879b9709143e1f593f0000001_u128,
@@ -520,7 +562,7 @@ impl Bn254 {
     }
     pub fn fr_from_bytes(bytes: [u8; 32]) -> Option<u256> {
         let val = u256::from_be_bytes(bytes);
-        if val < Self::BASE_MODULUS {
+        if val < Self::FR_MODULUS {
             Some(val)
         } else {
             None
@@ -551,7 +593,7 @@ impl Bn254 {
     pub fn sub(a: u256, b: u256) -> u256 {
         let (res, underflow) = a.overflowing_sub(b);
         if underflow {
-            res.wrapping_add(Self::BASE_MODULUS)
+            res.wrapping_add(Self::FR_MODULUS)
         } else {
             res
         }
@@ -735,7 +777,7 @@ impl Bn254 {
         }
 
         let point = G1Projective::from(G1Affine { x, y });
-        let result = Self::g1_scalar_mul(point, Self::BASE_MODULUS);
+        let result = Self::g1_scalar_mul(point, Self::FR_MODULUS);
         result.z == u256::from(0u8)
     }
 
