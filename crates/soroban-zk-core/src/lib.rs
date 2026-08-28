@@ -367,6 +367,13 @@ pub enum ZkError {
     InvalidInput,
     /// Serialized proof or point bytes could not be decoded into a valid structure.
     DeserializationError,
+    /// A raw Soroban host (CAP-0075) call trapped or returned an error that could
+    /// not be translated into a successful result. The host function may be
+    /// unavailable (e.g. local off-chain test environment) or rejected the input.
+    HostError,
+    /// A storage operation (read/write/remove) failed or required data was
+    /// missing from the Soroban ledger.
+    StorageError,
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.
@@ -491,11 +498,14 @@ impl Bn254 {
         0x97816a916871ca8d3c208c16d87cfd47_u128,
     );
     pub const G1_B: u256 = u256::from_words(0u128, 3u128);
-    /// G2 curve coefficient β = 3 + 19*u in Fq² (lifted constant)
-    /// Stored as (real, imaginary) = (3, 19) representing 3 + 19*u
-    /// Used in the G2 curve equation: y² = x³ + β over Fq²
-    pub const G2_B_REAL: u256 = u256::from_words(0u128, 3u128);
-    pub const G2_B_IMAG: u256 = u256::from_words(0u128, 19u128);
+    /// G2 curve coefficient `β = 3/(u + 9)` in Fq², the correct BN254 twist
+    /// parameter (where `u² = -1`). Previously this was incorrectly set to
+    /// `3 + 19*u`, which rejected every valid G2 point.
+    /// Stored as (real, imaginary). Used in the G2 curve equation: `y² = x³ + β`.
+    pub const G2_B_REAL: u256 =
+        u256::from_words(57263839228809413707999148736847571651u128, 241528894477357229398967524003378444517u128);
+    pub const G2_B_IMAG: u256 =
+        u256::from_words(784436153819307037095878749819829748u128, 222394522462485822084624302373924443602u128);
     pub const LEGENDRE_EXP_FR: ethnum::u256 = ethnum::u256::from_words(
         0x183227397098d014dc2822db40c0ac2e_u128,
         0x9419f4243cdcb848a1f0fac9f8000000_u128,
@@ -823,7 +833,7 @@ impl Bn254 {
     // G2 Point Validation (On-Curve and Subgroup Membership)
     // ========================================================================
     // The BN254 G2 curve is defined over Fq² as:
-    //   y² = x³ + β, where β = 3 + 19*u in Fq²
+    //   y² = x³ + β, where β = 3/(u + 9) in Fq² (u² = -1)
     //
     // Cofactor: h₂ = 21888242871839275222246405745257275088844257914179612981679871602714643767808
     // Full group order: h₂ * r where r = FR_MODULUS (the prime-order subgroup order)

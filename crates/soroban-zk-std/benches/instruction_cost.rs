@@ -1,10 +1,13 @@
 #![cfg(test)]
 
 use ethnum::u256;
-use soroban_sdk::{Env, U256};
+use soroban_sdk::{Bytes, Env, U256};
 use soroban_zk_core::{Bn254, G1Affine, G1Projective};
+use soroban_zk_std::groth16::Groth16VerifyingKey;
 use soroban_zk_std::pairing::{pairing_check, G2Affine};
 use soroban_zk_std::poseidon2::hash_to_field;
+use soroban_zk_std::vk::{load_vk, save_vk, G1_GENERATOR as VK_G1, G2_GENERATOR as VK_G2};
+use soroban_zk_std::ZkContract;
 
 const MAX_INSTRUCTIONS: u64 = 100_000_000;
 const TOTAL_BUDGET: u64 = 400_000_000;
@@ -222,4 +225,124 @@ fn bench_groth16_verify() {
         "groth16_verify exceeded 400M budget (cost: {})",
         cost
     );
+}
+
+/// Measures the instruction cost of a native CAP-0075 `bn254_multi_pairing_check`
+/// call (via [`pairing_check`]) for a given number of pairs. Each pair is a
+/// structurally valid `(G1, G2)` so the host path is fully exercised.
+fn mock_pairing_check(n: usize) -> u64 {
+    let g1 = g1_generator();
+    let neg_g1 = g1_generator_neg();
+    let g2 = g2_generator();
+
+    let mut pairs: std::vec::Vec<(G1Affine, G2Affine)> = std::vec::Vec::new();
+    for i in 0..n {
+        let g1pt = if i % 2 == 0 { g1 } else { neg_g1 };
+        pairs.push((g1pt, g2));
+    }
+
+    let env = setup_env();
+    let start = env.cost_estimate().budget().cpu_instruction_cost();
+    let _ = pairing_check(&env, &pairs);
+    env.cost_estimate().budget().cpu_instruction_cost() - start
+}
+
+#[test]
+fn bench_pairing_check() {
+    // Tracks total + per-pair marginal cost to document the asymptotic behavior
+    // of the native pairing host function.
+    let mut prev: Option<u64> = None;
+    for n in [1usize, 2, 4, 8] {
+        let cost = mock_pairing_check(n);
+        match prev {
+            Some(p) if n > 1 => {
+                let per_pair = cost.saturating_sub(p) / ((n / 2) as u64);
+                std::println!("pairing_check_{}: {} instructions (≈{} per extra pair)",
+                    n, cost, per_pair);
+            }
+            _ => std::println!("pairing_check_{}: {} instructions", n, cost),
+        }
+        check_cost(cost, &format!("pairing_check_{}", n));
+        prev = Some(cost);
+    }
+}
+
+/// Measures the instruction cost of reading a fixed-size payload from
+/// `StorageType::Instance` versus `StorageType::Persistent`, documenting the
+/// per-read gas/CPU difference between the two storage types (Issue #369).
+#[test]
+fn bench_vk_instance_vs_persistent() {
+    let n: usize = 32 * 1024; // one VK chunk (32 KiB)
+    let env = setup_env();
+    let id = env.register(ZkContract, ());
+    let key = soroban_sdk::Symbol::new(&env, "benchvk");
+
+    let data: std::vec::Vec<u8> = (0..n).map(|_| 0xABu8).collect();
+    let payload = Bytes::from_slice(&env, &data);
+
+    // Warm both stores (not measured).
+    env.as_contract(&id, || {
+        env.storage().instance().set(&key, &payload);
+        env.storage().persistent().set(&key, &payload);
+    });
+
+    let inst_cost = env.as_contract(&id, || {
+        let start = env.cost_estimate().budget().cpu_instruction_cost();
+        let _: Bytes = env.storage().instance().get(&key).unwrap();
+        env.cost_estimate().budget().cpu_instruction_cost() - start
+    });
+
+    let pers_cost = env.as_contract(&id, || {
+        let start = env.cost_estimate().budget().cpu_instruction_cost();
+        let _: Bytes = env.storage().persistent().get(&key).unwrap();
+        env.cost_estimate().budget().cpu_instruction_cost() - start
+    });
+
+    std::println!("vk_read_instance: {} instructions", inst_cost);
+    std::println!("vk_read_persistent: {} instructions", pers_cost);
+    std::println!(
+        "vk_read_persistent_overhead: {} instructions",
+        pers_cost.saturating_sub(inst_cost)
+    );
+    check_cost(inst_cost, "vk_read_instance");
+    check_cost(pers_cost, "vk_read_persistent");
+}
+
+/// Measures the full chunked save + load cost of a verification key via the
+/// `vk` module, for a key whose `ic` vector forces multiple 32 KiB chunks.
+#[test]
+fn bench_vk_chunked_roundtrip() {
+    // 1024 ic points ≈ 64 KiB, which spans two 32 KiB chunks.
+    let ic_len = 1024usize;
+    let env = setup_env();
+    let id = env.register(ZkContract, ());
+
+    let ic: std::vec::Vec<G1Affine> = std::vec![VK_G1; ic_len];
+    let vk = Groth16VerifyingKey {
+        alpha_g1: VK_G1,
+        beta_g2: VK_G2,
+        gamma_g2: VK_G2,
+        delta_g2: VK_G2,
+        ic: &ic,
+    };
+
+    env.as_contract(&id, || {
+        let start = env.cost_estimate().budget().cpu_instruction_cost();
+        save_vk(&env, &vk).unwrap();
+        let cost_write = env.cost_estimate().budget().cpu_instruction_cost() - start;
+
+        let start = env.cost_estimate().budget().cpu_instruction_cost();
+        let loaded = load_vk(&env).unwrap();
+        let cost_read = env.cost_estimate().budget().cpu_instruction_cost() - start;
+
+        std::println!("vk_save ({} ic pts): {} instructions", ic_len, cost_write);
+        std::println!("vk_load ({} ic pts): {} instructions", ic_len, cost_read);
+        assert_eq!(loaded.ic.len(), ic_len);
+        check_cost(cost_write, "vk_save");
+        check_cost(cost_read, "vk_load");
+
+        // Cleanup hook must purge the chunks.
+        soroban_zk_std::vk::clear_vk(&env);
+        assert!(load_vk(&env).is_err());
+    });
 }
