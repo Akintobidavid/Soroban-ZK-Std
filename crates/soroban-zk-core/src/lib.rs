@@ -583,58 +583,55 @@ impl Bn254 {
         }
     }
 
+    /// Constant-time modular addition: `(a + b) mod modulus`.
+    ///
+    /// Uses `overflowing_add` plus a branchless mask instead of a data-dependent
+    /// `if` so execution time does not vary with the operand values (timing
+    /// side-channel hardening for Issue #372).
     #[inline(always)]
     fn add_mod(a: u256, b: u256, modulus: u256) -> u256 {
         let (sum, overflow) = a.overflowing_add(b);
-        if overflow || sum >= modulus {
-            sum.wrapping_sub(modulus)
-        } else {
-            sum
-        }
+        let (reduced, no_underflow) = sum.overflowing_sub(modulus);
+        // need_reduce = true iff sum overflowed u256, OR sum >= modulus
+        // (sum >= modulus  <=>  sum.overflowing_sub(modulus) does NOT underflow)
+        let need_reduce = overflow | !no_underflow;
+        let mask = u256::from(0u8).wrapping_sub(u256::from(need_reduce as u8));
+        (mask & reduced) | (!mask & sum)
     }
 
+    /// Constant-time modular subtraction over the Fr modulus: `(a - b) mod FR_MODULUS`.
+    ///
+    /// Uses `overflowing_sub` plus a branchless mask instead of a data-dependent
+    /// `if` so execution time does not vary with the operand values (timing
+    /// side-channel hardening for Issue #372).
     pub fn sub(a: u256, b: u256) -> u256 {
         let (res, underflow) = a.overflowing_sub(b);
-        if underflow {
-            res.wrapping_add(Self::FR_MODULUS)
-        } else {
-            res
-        }
+        let mask = u256::from(0u8).wrapping_sub(u256::from(underflow as u8));
+        res.wrapping_add(mask & Self::FR_MODULUS)
     }
 
+    /// Constant-time modular multiplication: `(a * b) mod modulus`.
+    ///
+    /// The previous implementation short-circuited on `a == 0`, `a == 1`, or
+    /// `b == 1`, which leaks structural information about secret scalars
+    /// through timing (Issue #372). Both the overflow and non-overflow
+    /// reduction paths are now always computed, and the result is selected
+    /// via a branchless mask.
     #[inline(always)]
     fn mul_mod(a: u256, b: u256, modulus: u256) -> u256 {
         // Normalize inputs to [0, modulus)
         let a = a % modulus;
         let b = b % modulus;
 
-        // Fast path: if either operand is small, use direct multiplication
-        if a == u256::from(0u8) || b == u256::from(0u8) {
-            return u256::from(0u8);
-        }
-        if a == u256::from(1u8) {
-            return b;
-        }
-        if b == u256::from(1u8) {
-            return a;
-        }
-
-        // Use ethnum's optimized multiplication with overflow detection
         let (result, overflow) = a.overflowing_mul(b);
 
-        if !overflow {
-            // No overflow: simple modular reduction
-            result % modulus
-        } else {
-            // Overflow occurred: use Barrett-like reduction
-            // For 512-bit result, we compute: (a * b) mod modulus
-            // Using the identity: (a * b) mod m = ((a mod m) * (b mod m)) mod m
-            // But since we already normalized, we need a different approach
+        // Always compute both candidate results so control flow does not
+        // depend on whether the multiplication overflowed.
+        let no_overflow_result = result % modulus;
+        let overflow_result = Self::mul_mod_with_overflow(a, b, modulus);
 
-            // Split into high and low parts using bit manipulation
-            // This is more efficient than the shift-and-add loop
-            Self::mul_mod_with_overflow(a, b, modulus)
-        }
+        let mask = u256::from(0u8).wrapping_sub(u256::from(overflow as u8));
+        (mask & overflow_result) | (!mask & no_overflow_result)
     }
 
     /// Handles modular multiplication when overflow is detected.
