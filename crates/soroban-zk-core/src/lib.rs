@@ -1575,3 +1575,6 @@ mod tests {
         assert_eq!(result, a, "fq2 addition and subtraction should be inverse");
     }
 }
+
+#[cfg(kani)]
+pub mod kani_tests;
