@@ -417,10 +417,17 @@ impl G1Affine {
 
 impl From<G1Affine> for G1Projective {
     fn from(affine: G1Affine) -> Self {
-        Self {
-            x: affine.x,
-            y: affine.y,
-            z: u256::from(1u8),
+        // The affine point at infinity maps to the projective identity (z = 0)
+        // rather than (0, 0, 1), which is not a valid curve point and would
+        // corrupt Jacobian addition.
+        if affine.x == u256::from(0u8) && affine.y == u256::from(0u8) {
+            Self::identity()
+        } else {
+            Self {
+                x: affine.x,
+                y: affine.y,
+                z: u256::from(1u8),
+            }
         }
     }
 }
@@ -524,6 +531,204 @@ pub struct JacobianPoint {
     pub z: u256,
 }
 
+// ============================================================================
+// Montgomery Modular Arithmetic
+//
+// This replaces the previous shift-and-add / Karatsuba reduction path used by
+// `mul_mod` with constant-time Montgomery multiplication. Montgomery form maps
+// a field element `a` to `a·R mod N` (where `R = 2²⁵⁶` and `N` is the field
+// modulus), turning the expensive division/modulo of `a·b mod N` into cheap
+// shifts and additions:
+//
+//   a·b mod N = from_montgomery(montgomery_mul(to_montgomery(a),
+//                                              to_montgomery(b)))
+//
+// The CIOS (Coarsely Integrated Operand Scanning) variant below is fully
+// constant-time: its control flow depends only on the fixed limb count, never
+// on the data. Inputs/outputs are 256-bit values stored as four 64-bit limbs
+// in little-endian order.
+// ============================================================================
+
+/// A 256-bit value stored as four 64-bit limbs, little-endian.
+type Limbs = [u64; 4];
+
+#[inline(always)]
+fn to_limbs(x: u256) -> Limbs {
+    let mask = u256::from(u128::MAX);
+    [
+        (x & mask).as_u128() as u64,
+        ((x >> 64u32) & mask).as_u128() as u64,
+        ((x >> 128u32) & mask).as_u128() as u64,
+        (x >> 192u32).as_u128() as u64,
+    ]
+}
+
+#[inline(always)]
+fn from_limbs(l: &Limbs) -> u256 {
+    // Build the 256-bit value from 64-bit limbs via 128-bit intermediates to
+    // avoid shifting the (256-bit) `u256` directly.
+    let lo = (l[0] as u128) | ((l[1] as u128) << 64);
+    let hi = (l[2] as u128) | ((l[3] as u128) << 64);
+    u256::from_words(hi, lo)
+}
+
+/// Five-limb (320-bit) comparison / subtraction, used only for the final
+/// reduction of the SOS accumulator.
+type Limbs5 = [u64; 5];
+
+#[inline(always)]
+fn limbs5_ge(a: &Limbs5, b: &Limbs5) -> bool {
+    for i in (0..5).rev() {
+        if a[i] != b[i] {
+            return a[i] > b[i];
+        }
+    }
+    false
+}
+
+#[inline(always)]
+fn limbs5_sub_assign(a: &mut Limbs5, b: &Limbs5) {
+    let mut borrow: u128 = 0;
+    for i in 0..5 {
+        let (r, bo) = a[i].overflowing_sub(b[i]);
+        let (r2, bo2) = r.overflowing_sub(borrow as u64);
+        a[i] = r2;
+        borrow = if bo || bo2 { 1 } else { 0 };
+    }
+}
+
+/// Constant-time SOS (Separated Operand Scanning) Montgomery multiplication.
+///
+/// Computes `a·b·R⁻¹ mod N` where `a`, `b` are in Montgomery form, `N` is the
+/// modulus, and `n0inv = -N⁻¹ mod 2⁶⁴`. The result is also in Montgomery form
+/// and is guaranteed `< N`. The control flow depends only on the fixed limb
+/// count (`4`), never on the data, so the routine is constant-time.
+#[inline(always)]
+fn montgomery_mul(a: Limbs, b: Limbs, n: Limbs, n0inv: u64) -> Limbs {
+    let mut t = [0u64; 9];
+    for i in 0..4 {
+        // t += a[i] * b  (radix 2⁶⁴, 4 limbs)
+        let mut carry: u128 = 0;
+        let ai = a[i] as u128;
+        for j in 0..4 {
+            let prod = ai * (b[j] as u128) + (t[i + j] as u128) + carry;
+            t[i + j] = prod as u64;
+            carry = prod >> 64;
+        }
+        // propagate the carry into the high limbs
+        let mut idx = i + 4;
+        let mut c = carry;
+        while c > 0 {
+            let s = (t[idx] as u128) + c;
+            t[idx] = s as u64;
+            c = s >> 64;
+            idx += 1;
+        }
+
+        // m = (t[i] * n0inv) mod 2⁶⁴ — cancels the low word when we add m·N.
+        let m = ((t[i] as u128) * (n0inv as u128)) as u64;
+        let m128 = m as u128;
+
+        // t += m * n
+        let mut carry: u128 = 0;
+        for j in 0..4 {
+            let prod = m128 * (n[j] as u128) + (t[i + j] as u128) + carry;
+            t[i + j] = prod as u64;
+            carry = prod >> 64;
+        }
+        let mut idx = i + 4;
+        let mut c = carry;
+        while c > 0 {
+            let s = (t[idx] as u128) + c;
+            t[idx] = s as u64;
+            c = s >> 64;
+            idx += 1;
+        }
+    }
+
+    // The result is the high 256 bits (t[4..8]); it is < 2N, so at most a few
+    // conditional subtractions of N leave it in [0, N).
+    let mut r: Limbs5 = [t[4], t[5], t[6], t[7], t[8]];
+    let n5: Limbs5 = [n[0], n[1], n[2], n[3], 0];
+    while limbs5_ge(&r, &n5) {
+        limbs5_sub_assign(&mut r, &n5);
+    }
+    [r[0], r[1], r[2], r[3]]
+}
+
+/// A pre-parameterized Montgomery engine for a fixed modulus `N`.
+struct Montgomery {
+    n: Limbs,
+    n0inv: u64,
+    r2: Limbs,
+}
+
+impl Montgomery {
+    const fn new(n: Limbs, n0inv: u64, r2: Limbs) -> Self {
+        Self { n, n0inv, r2 }
+    }
+
+    /// `a·R mod N` (move `a` into Montgomery form). Assumes `a < N`.
+    #[inline(always)]
+    fn to_montgomery(&self, a: u256) -> u256 {
+        from_limbs(&montgomery_mul(to_limbs(a), self.r2, self.n, self.n0inv))
+    }
+
+    /// `a·R⁻¹ mod N` (move `a` out of Montgomery form). Assumes `a < N`.
+    #[inline(always)]
+    fn from_montgomery(&self, a: u256) -> u256 {
+        let one = [1u64, 0, 0, 0];
+        from_limbs(&montgomery_mul(to_limbs(a), one, self.n, self.n0inv))
+    }
+
+    /// `a·b mod N`, computed entirely via Montgomery reduction. Assumes `a, b < N`.
+    #[inline(always)]
+    fn mul_mod(&self, a: u256, b: u256) -> u256 {
+        // a*R and b*R (Montgomery form)
+        let ma = montgomery_mul(to_limbs(a), self.r2, self.n, self.n0inv);
+        let mb = montgomery_mul(to_limbs(b), self.r2, self.n, self.n0inv);
+        // (a*R)·(b*R)·R⁻¹ = a·b·R
+        let mc = montgomery_mul(ma, mb, self.n, self.n0inv);
+        // (a·b·R)·1·R⁻¹ = a·b
+        let one = [1u64, 0, 0, 0];
+        from_limbs(&montgomery_mul(mc, one, self.n, self.n0inv))
+    }
+}
+
+// Precomputed Montgomery parameters for the two BN254 field moduli.
+// `r2 = R² mod N` with `R = 2²⁵⁶`; `n0inv = -N⁻¹ mod 2⁶⁴`.
+// (Computed offline; fixed because the moduli are constant.)
+const FR_N: Limbs = [
+    4891460686036598785,
+    2896914383306846353,
+    13281191951274694749,
+    3486998266802970665,
+];
+const FR_N0INV: u64 = 0xc2e1f593efffffff;
+const FR_R2: Limbs = [
+    1997599621687373223,
+    6052339484930628067,
+    10108755138030829701,
+    150537098327114917,
+];
+
+const FQ_N: Limbs = [
+    4332616871279656263,
+    10917124144477883021,
+    13281191951274694749,
+    3486998266802970665,
+];
+const FQ_N0INV: u64 = 0x87d20782e4866389;
+const FQ_R2: Limbs = [
+    17522657719365597833,
+    13107472804851548667,
+    5164255478447964150,
+    493319470278259999,
+];
+
+const FR_MONT: Montgomery = Montgomery::new(FR_N, FR_N0INV, FR_R2);
+const FQ_MONT: Montgomery = Montgomery::new(FQ_N, FQ_N0INV, FQ_R2);
+
 impl Bn254 {
     /// Deprecated alias for [`Self::FR_MODULUS`].
     ///
@@ -621,9 +826,16 @@ impl Bn254 {
     /// via a branchless mask.
     #[inline(always)]
     fn mul_mod(a: u256, b: u256, modulus: u256) -> u256 {
-        // Normalize inputs to [0, modulus)
         let a = a % modulus;
         let b = b % modulus;
+        if modulus == Self::FR_MODULUS {
+            FR_MONT.mul_mod(a, b)
+        } else if modulus == Self::FQ_MODULUS {
+            FQ_MONT.mul_mod(a, b)
+        } else {
+            Self::mul_mod_naive(a, b, modulus)
+        }
+    }
 
         let (result, overflow) = a.overflowing_mul(b);
 
@@ -636,59 +848,38 @@ impl Bn254 {
         (mask & overflow_result) | (!mask & no_overflow_result)
     }
 
-    /// Handles modular multiplication when overflow is detected.
-    /// Uses an optimized algorithm that's significantly faster than shift-and-add.
-    #[inline(always)]
-    fn mul_mod_with_overflow(a: u256, b: u256, modulus: u256) -> u256 {
-        // Use Karatsuba-inspired decomposition for large multiplications
-        // Split a and b into high and low 128-bit parts
         let mask_128 = u256::from(u128::MAX);
-
         let a_low = a & mask_128;
         let a_high = a >> 128;
         let b_low = b & mask_128;
         let b_high = b >> 128;
 
-        // Compute partial products (these won't overflow u256)
         let ll = a_low * b_low;
         let lh = a_low * b_high;
         let hl = a_high * b_low;
         let hh = a_high * b_high;
 
-        // Combine: result = ll + (lh << 128) + (hl << 128) + (hh << 256)
-        // Do this modulo m to avoid overflow
-
         let mut result = ll % modulus;
-
-        // Add (lh << 128) mod modulus
         let lh_shifted = Self::shift_left_mod(lh, 128, modulus);
         result = Self::add_mod(result, lh_shifted, modulus);
-
-        // Add (hl << 128) mod modulus
         let hl_shifted = Self::shift_left_mod(hl, 128, modulus);
         result = Self::add_mod(result, hl_shifted, modulus);
-
-        // Add (hh << 256) mod modulus
         let hh_shifted = Self::shift_left_mod(hh, 256, modulus);
         result = Self::add_mod(result, hh_shifted, modulus);
 
         result
     }
 
-    /// Efficiently computes (value << shift) mod modulus
+    /// Efficiently computes `(value << shift) mod modulus` via repeated doubling.
     #[inline(always)]
     fn shift_left_mod(value: u256, shift: u32, modulus: u256) -> u256 {
         if value == u256::from(0u8) {
             return u256::from(0u8);
         }
-
         let mut result = value % modulus;
-
-        // Use repeated doubling, but in chunks for efficiency
         for _ in 0..shift {
             result = Self::add_mod(result, result, modulus);
         }
-
         result
     }
 
@@ -733,6 +924,48 @@ impl Bn254 {
         }
         let exponent = Self::FR_MODULUS - u256::from(2u8);
         Self::pow(a, exponent)
+    }
+
+    // ========================================================================
+    // Montgomery form transition functions (BN254 scalar field, `FR_MODULUS`)
+    // ========================================================================
+
+    /// Moves `a` into Montgomery form: returns `a·R mod r` where `R = 2²⁵⁶`.
+    ///
+    /// The resulting value is valid input to [`Self::montgomery_mul`]-style
+    /// operations but is still a plain `u256` in `[0, r)`, so it can be used
+    /// with any existing field routine (e.g. stored in a struct).
+    pub fn to_montgomery(a: u256) -> u256 {
+        FR_MONT.to_montgomery(a % Self::FR_MODULUS)
+    }
+
+    /// Moves `a` out of Montgomery form: returns `a·R⁻¹ mod r`.
+    ///
+    /// Inverse of [`Self::to_montgomery`]. Inputs must be `< r`; values `>= r`
+    /// are reduced first.
+    pub fn from_montgomery(a: u256) -> u256 {
+        FR_MONT.from_montgomery(a % Self::FR_MODULUS)
+    }
+
+    /// Reference modular multiplication over `FR_MODULUS`, kept public so the
+    /// benchmark suite can compare the Montgomery engine against the
+    /// pre-optimization implementation (see `benches/instruction_cost.rs`).
+    pub fn mul_mod_legacy(a: u256, b: u256) -> u256 {
+        Self::mul_mod_naive(a, b, Self::FR_MODULUS)
+    }
+
+    // ========================================================================
+    // Montgomery form transition functions (BN254 base field, `FQ_MODULUS`)
+    // ========================================================================
+
+    /// Moves `a` into Montgomery form over `FQ_MODULUS`: `a·R mod q`.
+    pub fn to_montgomery_fq(a: u256) -> u256 {
+        FQ_MONT.to_montgomery(a % Self::FQ_MODULUS)
+    }
+
+    /// Moves `a` out of Montgomery form over `FQ_MODULUS`: `a·R⁻¹ mod q`.
+    pub fn from_montgomery_fq(a: u256) -> u256 {
+        FQ_MONT.from_montgomery(a % Self::FQ_MODULUS)
     }
 
     pub fn mul_fq(a: u256, b: u256) -> u256 {
