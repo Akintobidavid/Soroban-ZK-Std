@@ -41,19 +41,114 @@ fn u(env: &Env, hi: u128, lo: u128) -> U256 {
 /// Field addition mod r: (a + b) mod r.
 /// Both inputs must be < r. The modulus is passed in so callers can reuse a
 /// cached value instead of rebuilding it on every addition.
-fn field_add(a: &U256, b: &U256, modulus: &U256) -> U256 {
-    // Soroban U256 addition can panic if the sum exceeds the 256-bit range.
-    // Reduce each operand modulo the field modulus first, then add the reduced
-    // values. Since each operand is now < modulus, their sum is always safe.
-    let a_mod = if a >= modulus { a.sub(modulus) } else { a.clone() };
-    let b_mod = if b >= modulus { b.sub(modulus) } else { b.clone() };
-
-    let sum = a_mod.add(&b_mod);
-    if sum >= *modulus {
-        sum.sub(modulus)
-    } else {
-        sum
+/// Reads a `U256` into a big-endian byte array without any host-side
+/// arithmetic (no `sub`/`add` calls that could trap on under/overflow).
+fn u256_to_be_array(v: &U256) -> [u8; 32] {
+    let bytes = v.to_be_bytes();
+    let mut out = [0u8; 32];
+    for i in 0..32u32 {
+        out[i as usize] = bytes.get_unchecked(i);
     }
+    out
+}
+
+/// Branchless byte select: returns `a` if `mask_true`, else `b`.
+#[inline(always)]
+fn ct_byte_select(mask_true: bool, a: u8, b: u8) -> u8 {
+    let m = 0u8.wrapping_sub(mask_true as u8);
+    (a & m) | (b & !m)
+}
+
+/// Constant-time `a >= b` over big-endian byte arrays of equal length.
+/// Scans every byte regardless of where the arrays first differ.
+fn be_ge<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
+    let mut lt = false;
+    let mut decided = false;
+    for i in 0..N {
+        let is_lt = a[i] < b[i];
+        let is_gt = a[i] > b[i];
+        let this_decides = !decided && (is_lt || is_gt);
+        lt = lt || (this_decides && is_lt);
+        decided = decided || this_decides;
+    }
+    !lt
+}
+
+fn zero_extend32(a: &[u8; 32]) -> [u8; 33] {
+    let mut out = [0u8; 33];
+    out[1..].copy_from_slice(a);
+    out
+}
+
+/// 32-byte + 32-byte -> 33-byte big-endian sum. Plain ripple-carry over
+/// primitive `u16`s: no SDK calls, so nothing here can trap.
+fn be_add32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 33] {
+    let mut out = [0u8; 33];
+    let mut carry: u16 = 0;
+    for i in (0..32).rev() {
+        let s = a[i] as u16 + b[i] as u16 + carry;
+        out[i + 1] = (s & 0xFF) as u8;
+        carry = s >> 8;
+    }
+    out[0] = carry as u8;
+    out
+}
+
+/// 33-byte - 33-byte big-endian difference, wrapping (caller selects
+/// whether the result is meaningful via `be_ge`). Borrow propagation uses
+/// an arithmetic shift instead of an `if`, so it never branches on the
+/// operand values.
+fn be_sub33(a: &[u8; 33], b: &[u8; 33]) -> [u8; 33] {
+    let mut out = [0u8; 33];
+    let mut borrow: i16 = 0;
+    for i in (0..33).rev() {
+        let d: i16 = a[i] as i16 - b[i] as i16 - borrow;
+        borrow = (d >> 15) & 1;
+        out[i] = (d & 0xFF) as u8;
+    }
+    out
+}
+
+/// Reduces `x` mod `m` by at most one subtraction, without ever calling a
+/// host `sub` that could underflow: the subtraction always runs on plain
+/// bytes, and the result is chosen via a branchless mask (Issue #372).
+fn reduce_once(x: &[u8; 32], m: &[u8; 32]) -> [u8; 32] {
+    let x33 = zero_extend32(x);
+    let m33 = zero_extend32(m);
+    let ge = be_ge(&x33, &m33);
+    let sub = be_sub33(&x33, &m33);
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = ct_byte_select(ge, sub[i + 1], x[i]);
+    }
+    out
+}
+
+/// Constant-time modular addition. Never calls `U256::sub`/`>=` on raw
+/// operands (both can trap or branch on secret magnitude via the host);
+/// instead reduces both operands and the final sum using masked byte
+/// selection over raw arrays (Issue #372).
+fn field_add(a: &U256, b: &U256, modulus: &U256) -> U256 {
+    let env = a.env();
+    let a_arr = u256_to_be_array(a);
+    let b_arr = u256_to_be_array(b);
+    let m_arr = u256_to_be_array(modulus);
+
+    let a_r = reduce_once(&a_arr, &m_arr);
+    let b_r = reduce_once(&b_arr, &m_arr);
+
+    let sum33 = be_add32(&a_r, &b_r);
+    let m33 = zero_extend32(&m_arr);
+    let ge = be_ge(&sum33, &m33);
+    let sub33 = be_sub33(&sum33, &m33);
+
+    let mut result = [0u8; 32];
+    for i in 0..32 {
+        result[i] = ct_byte_select(ge, sub33[i + 1], sum33[i + 1]);
+    }
+
+    let bytes = Bytes::from_array(env, &result);
+    U256::from_be_bytes(env, &bytes)
 }
 
 fn fr_to_u256(env: &Env, input: Fr) -> U256 {

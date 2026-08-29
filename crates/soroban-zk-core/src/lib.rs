@@ -355,6 +355,7 @@ pub mod elgamal {
 }
 
 pub use elgamal::ElGamalCiphertext;
+pub mod halo2;
 pub mod polynomial;
 pub use polynomial::{DensePolynomial, SparsePolynomial};
 
@@ -374,6 +375,9 @@ pub enum ZkError {
     /// A storage operation (read/write/remove) failed or required data was
     /// missing from the Soroban ledger.
     StorageError,
+     /// A zero-knowledge constraint or gadget invariant was violated by the
+    /// supplied witness (e.g. a boolean gadget received a non-0/1 value).
+    ConstraintUnsatisfied,
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.
@@ -785,32 +789,40 @@ impl Bn254 {
         }
     }
 
+    /// Constant-time modular addition: `(a + b) mod modulus`.
+    ///
+    /// Uses `overflowing_add` plus a branchless mask instead of a data-dependent
+    /// `if` so execution time does not vary with the operand values (timing
+    /// side-channel hardening for Issue #372).
     #[inline(always)]
     fn add_mod(a: u256, b: u256, modulus: u256) -> u256 {
         let (sum, overflow) = a.overflowing_add(b);
-        if overflow || sum >= modulus {
-            sum.wrapping_sub(modulus)
-        } else {
-            sum
-        }
+        let (reduced, no_underflow) = sum.overflowing_sub(modulus);
+        // need_reduce = true iff sum overflowed u256, OR sum >= modulus
+        // (sum >= modulus  <=>  sum.overflowing_sub(modulus) does NOT underflow)
+        let need_reduce = overflow | !no_underflow;
+        let mask = u256::from(0u8).wrapping_sub(u256::from(need_reduce as u8));
+        (mask & reduced) | (!mask & sum)
     }
 
+    /// Constant-time modular subtraction over the Fr modulus: `(a - b) mod FR_MODULUS`.
+    ///
+    /// Uses `overflowing_sub` plus a branchless mask instead of a data-dependent
+    /// `if` so execution time does not vary with the operand values (timing
+    /// side-channel hardening for Issue #372).
     pub fn sub(a: u256, b: u256) -> u256 {
         let (res, underflow) = a.overflowing_sub(b);
-        if underflow {
-            res.wrapping_add(Self::FR_MODULUS)
-        } else {
-            res
-        }
+        let mask = u256::from(0u8).wrapping_sub(u256::from(underflow as u8));
+        res.wrapping_add(mask & Self::FR_MODULUS)
     }
 
-    /// Modular multiplication `a·b mod modulus`.
+    /// Constant-time modular multiplication: `(a * b) mod modulus`.
     ///
-    /// For the two fixed BN254 field moduli (`FR_MODULUS` and `FQ_MODULUS`) this
-    /// is evaluated with the constant-time Montgomery engine defined above,
-    /// replacing the previous shift-and-add loop. Any other modulus falls back
-    /// to the reference (`mul_mod_naive`) implementation, which keeps the
-    /// function total without regressing the supported fields.
+    /// The previous implementation short-circuited on `a == 0`, `a == 1`, or
+    /// `b == 1`, which leaks structural information about secret scalars
+    /// through timing (Issue #372). Both the overflow and non-overflow
+    /// reduction paths are now always computed, and the result is selected
+    /// via a branchless mask.
     #[inline(always)]
     fn mul_mod(a: u256, b: u256, modulus: u256) -> u256 {
         let a = a % modulus;
@@ -824,26 +836,16 @@ impl Bn254 {
         }
     }
 
-    /// Reference (pre-optimization) modular multiplication, retained for
-    /// equivalence testing and instruction-cost benchmarking against the
-    /// Montgomery engine. Uses a Karatsuba-style decomposition with repeated
-    /// doubling rather than raw shift-and-add.
-    #[inline(always)]
-    fn mul_mod_naive(a: u256, b: u256, modulus: u256) -> u256 {
-        if a == u256::from(0u8) || b == u256::from(0u8) {
-            return u256::from(0u8);
-        }
-        if a == u256::from(1u8) {
-            return b;
-        }
-        if b == u256::from(1u8) {
-            return a;
-        }
-
         let (result, overflow) = a.overflowing_mul(b);
-        if !overflow {
-            return result % modulus;
-        }
+
+        // Always compute both candidate results so control flow does not
+        // depend on whether the multiplication overflowed.
+        let no_overflow_result = result % modulus;
+        let overflow_result = Self::mul_mod_with_overflow(a, b, modulus);
+
+        let mask = u256::from(0u8).wrapping_sub(u256::from(overflow as u8));
+        (mask & overflow_result) | (!mask & no_overflow_result)
+    }
 
         let mask_128 = u256::from(u128::MAX);
         let a_low = a & mask_128;
@@ -1015,6 +1017,19 @@ impl Bn254 {
         let rhs = Self::add_mod(x_cb, Self::G1_B, Self::FQ_MODULUS);
 
         y_sq == rhs
+    }
+
+    /// Returns `true` if `(x, y)` (each an `Fq2` element as `(real, imag)`) lies
+    /// on the BN254 G2 twist curve `y² = x³ + b'`.
+    pub fn is_valid_g2_curve(x: (u256, u256), y: (u256, u256)) -> bool {
+        Self::is_on_curve(x, y)
+    }
+
+    /// Returns `true` if `(x, y)` lies on the curve AND in the prime-order
+    /// subgroup. Required before using any G2 point in a pairing check — a
+    /// point on the curve but outside the subgroup breaks soundness.
+    pub fn is_valid_g2_subgroup(x: (u256, u256), y: (u256, u256)) -> bool {
+        Self::is_in_correct_subgroup(x, y)
     }
 
     pub fn is_valid_g1_subgroup(x: u256, y: u256) -> bool {
@@ -1199,7 +1214,7 @@ impl Bn254 {
         };
 
         // [r]·Q must be the point at infinity (z == 0 in Jacobian coordinates).
-        let result = Self::g2_scalar_mul(point, Self::BASE_MODULUS);
+        let result = Self::g2_scalar_mul(point, Self::FR_MODULUS);
         result.is_identity()
     }
 
@@ -1808,134 +1823,5 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod montgomery_tests {
-    use super::*;
-
-    /// Small deterministic xorshift PRNG so the suite stays `#![no_std]`.
-    struct Prng(u64);
-    impl Prng {
-        fn new(seed: u64) -> Self {
-            Prng(seed | 1)
-        }
-        fn next_u64(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            self.0 = x;
-            x
-        }
-        fn next_u256(&mut self) -> u256 {
-            u256::from(self.next_u64() as u128)
-                | (u256::from(self.next_u64() as u128) << 64)
-                | (u256::from(self.next_u64() as u128) << 128)
-                | (u256::from(self.next_u64() as u128) << 192)
-        }
-    }
-
-    #[test]
-    fn montgomery_constants_match_moduli() {
-        // The precomputed limb arrays must reconstruct the real moduli.
-        assert_eq!(FR_N[0], 4891460686036598785);
-        assert_eq!(FR_N[1], 2896914383306846353);
-        assert_eq!(from_limbs(&[1u64, 0, 0, 0]), u256::from(1u8));
-        assert_eq!(from_limbs(&[0u64, 1, 0, 0]), u256::from(1u8) << 64);
-        assert_eq!(from_limbs(&FR_N), Bn254::FR_MODULUS);
-        assert_eq!(from_limbs(&FQ_N), Bn254::FQ_MODULUS);
-        // Both moduli are 254-bit, hence strictly below 2²⁵⁶.
-        assert!(Bn254::FR_MODULUS < u256::MAX);
-        assert!(Bn254::FQ_MODULUS < u256::MAX);
-    }
-
-    #[test]
-    fn to_from_montgomery_roundtrip_fr() {
-        let mut rng = Prng::new(0x1234_5678);
-        // Keep `a` strictly below the modulus (a valid field element) so the
-        // Montgomery round-trip is well defined.
-        let modulus_bound = Bn254::FR_MODULUS - u256::from(1u8);
-        for _ in 0..2000 {
-            let a = rng.next_u256() % modulus_bound;
-            let m = Bn254::to_montgomery(a);
-            // Montgomery form is also a valid field element < r.
-            assert!(m < Bn254::FR_MODULUS, "to_montgomery out of range");
-            assert_eq!(Bn254::from_montgomery(m), a, "roundtrip failed");
-        }
-        // Edge cases.
-        assert_eq!(Bn254::from_montgomery(Bn254::to_montgomery(u256::from(0u8))), u256::from(0u8));
-        assert_eq!(Bn254::from_montgomery(Bn254::to_montgomery(u256::from(1u8))), u256::from(1u8));
-        assert_eq!(
-            Bn254::from_montgomery(Bn254::to_montgomery(Bn254::FR_MODULUS - u256::from(1u8))),
-            Bn254::FR_MODULUS - u256::from(1u8)
-        );
-    }
-
-    #[test]
-    fn to_from_montgomery_roundtrip_fq() {
-        let mut rng = Prng::new(0x9abc_def0);
-        let modulus_bound = Bn254::FQ_MODULUS - u256::from(1u8);
-        for _ in 0..2000 {
-            let a = rng.next_u256() % modulus_bound;
-            let m = Bn254::to_montgomery_fq(a);
-            assert!(m < Bn254::FQ_MODULUS, "to_montgomery_fq out of range");
-            assert_eq!(Bn254::from_montgomery_fq(m), a, "roundtrip failed");
-        }
-    }
-
-    /// Property test: Montgomery `mul_mod` must exactly match the reference
-    /// (`mul_mod_naive`) over the scalar field for random, edge, and
-    /// out-of-range inputs.
-    #[test]
-    fn montgomery_matches_naive_fr() {
-        let mut rng = Prng::new(0x0bad_c0de);
-        let check = |a: u256, b: u256| {
-            let expected = Bn254::mul_mod_naive(a, b, Bn254::FR_MODULUS);
-            assert_eq!(Bn254::mul(a, b), expected, "FR mismatch a={} b={}", a, b);
-        };
-        for _ in 0..5000 {
-            check(rng.next_u256(), rng.next_u256());
-            check(rng.next_u256() % Bn254::FR_MODULUS, rng.next_u256() % Bn254::FR_MODULUS);
-        }
-        // Edge cases.
-        check(u256::from(0u8), u256::from(0u8));
-        check(u256::from(0u8), Bn254::FR_MODULUS - u256::from(1u8));
-        check(u256::from(1u8), u256::from(1u8));
-        check(Bn254::FR_MODULUS - u256::from(1u8), Bn254::FR_MODULUS - u256::from(1u8));
-        check(Bn254::FR_MODULUS, Bn254::FR_MODULUS); // out-of-range inputs
-    }
-
-    #[test]
-    fn montgomery_matches_naive_fq() {
-        let mut rng = Prng::new(0x1357_9bdf);
-        for _ in 0..5000 {
-            let a = Bn254::FQ_MODULUS % rng.next_u256().max(u256::from(1u8));
-            let b = Bn254::FQ_MODULUS % rng.next_u256().max(u256::from(1u8));
-            let expected = Bn254::mul_mod_naive(a, b, Bn254::FQ_MODULUS);
-            assert_eq!(Bn254::mul_fq(a, b), expected, "FQ mismatch a={} b={}", a, b);
-        }
-    }
-
-    /// Squaring in Montgomery form must agree with `a² mod N`.
-    #[test]
-    fn montgomery_square_matches() {
-        let mut rng = Prng::new(0xfeed_beef);
-        for _ in 0..3000 {
-            let a = Bn254::FR_MODULUS % rng.next_u256().max(u256::from(1u8));
-            let sq = Bn254::mul(a, a);
-            let expected = Bn254::mul_mod_naive(a, a, Bn254::FR_MODULUS);
-            assert_eq!(sq, expected);
-        }
-    }
-
-    /// End-to-end sanity: known BN254 scalar-field multiplication.
-    #[test]
-    fn montgomery_known_vector_fr() {
-        // (2^128) * (2^128) mod r, computed two ways, must agree.
-        let a = u256::from(1u128) << 128;
-        let b = u256::from(1u128) << 128;
-        assert_eq!(
-            Bn254::mul(a, b),
-            Bn254::mul_mod_naive(a, b, Bn254::FR_MODULUS)
-        );
-    }
-}
+#[cfg(kani)]
+pub mod kani_tests;
