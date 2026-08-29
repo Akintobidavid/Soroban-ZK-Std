@@ -6,6 +6,11 @@ description = "Core cryptographic primitives for Soroban ZK Standard."
 repository = "https://github.com/georgegoldman/Soroban-ZK-Std"
 license.workspace = true
 
+[features]
+# Enables the range-proof prover. Disable for verifier-only WASM deployments
+# to minimize code size.
+prover = []
+
 [dependencies]
 ethnum = {workspace = true}
 num-traits = { version = "0.2.19", default-features = false, features = ["libm"] }
