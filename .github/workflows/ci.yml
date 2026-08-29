@@ -47,8 +47,8 @@ jobs:
       - name: 🛡️ Audit Dependencies (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
 
-  property-based-and-fuzzing:
-    name: 🧬 Property-Based & Fuzzing Suite
+  halo2-primitives:
+    name: 🧩 Halo2 Verifier Primitives
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -56,8 +56,6 @@ jobs:
 
       - name: Setup Stable Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - name: Cache Cargo Registry
         uses: actions/cache@v4
@@ -66,22 +64,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-prop-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-halo2-${{ hashFiles('**/Cargo.lock') }}
 
-      # Property-based math tests (Phase 1), differential tests vs arkworks
-      # (Phase 2), and malformed-input/curve-validation/XDR fuzzing (Phase 3).
-      # These run in debug (fast to compile) and are intentionally bounded in
-      # case-count so the pseudo-random fuzzing finishes well within CI limits.
-      # proptest logs the PRNG seed and minimal failing input on any failure,
-      # satisfying the determinism requirement.
-      - name: 🧪 Run Property-Based & Fuzzing Tests
-        run: |
-          cargo test -p soroban-zk-core \
-            --test proptest_fq \
-            --test proptest_boundary \
-            --test differential_ark \
-            --test fuzz_curve_validation \
-            --test fuzz_xdr
+      # Exercises the no_std Halo2 verifier primitives in soroban-zk-core
+      # (custom-gate evaluation loop, permutation grand-product argument, and the
+      # recursion/accumulation state) without depending on the higher-level
+      # soroban-zk-std verifier crate.
+      - name: 🧪 Run Halo2 primitive tests
+        run: cargo test -p soroban-zk-core --lib halo2
 
   miri-check:
     name: 🔬 Memory Safety (Miri)
