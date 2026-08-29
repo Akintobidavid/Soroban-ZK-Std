@@ -1,0 +1,23 @@
+name: Kani Formal Verification
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    paths:
+      - 'crates/soroban-zk-core/**'
+
+jobs:
+  kani:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Kani
+        uses: model-checking/kani-github-action@v1.2
+        with:
+          enable-propp: true
+      - name: Run Kani Proofs
+        run: cargo kani
+        working-directory: crates/soroban-zk-core
