@@ -684,7 +684,7 @@ impl Poseidon2Sponge {
     pub fn absorb(&mut self, inputs: &[U256]) {
         for input in inputs {
             let cur = self.state.get(self.rate_idx).unwrap();
-            let next = field_add(&cur, input, &self.modulus);
+            let next = field_add(&self.env, &cur, input, &self.modulus);
             self.state.set(self.rate_idx, next);
             self.rate_idx += 1;
             if self.rate_idx == RATE {
@@ -841,9 +841,50 @@ mod tests {
         let a = modulus.clone().sub(&U256::from_u128(&env, 1));
         let b = U256::from_u128(&env, 2);
 
-        let result = field_add(&a, &b, &modulus);
+        let result = field_add(&env, &a, &b, &modulus);
 
         assert_eq!(result, U256::from_u128(&env, 1));
+    }
+
+    #[test]
+    fn field_add_no_panic_on_max_boundary_values() {
+        let env = env();
+        let modulus = fr_modulus(&env);
+
+        // Deliberately near the 2^256 boundary: a = U256::MAX - 1,
+        // b = U256::MAX - 2. Their naive sum exceeds 2^256, which previously
+        // panicked the host via a direct `.add()`.
+        let max = U256::from_be_bytes(
+            &env,
+            &Bytes::from_array(&env, &[0xffu8; 32]),
+        );
+        let a = max.sub(&U256::from_u128(&env, 1));
+        let b = max.sub(&U256::from_u128(&env, 2));
+
+        // Must not panic and must return a properly reduced field element.
+        let result = field_add(&env, &a, &b, &modulus);
+
+        // Cross-check the expected value in ethnum space (reduce each operand
+        // first so the addition is in-range, exactly as field_add does).
+        let mut mb = [0u8; 32];
+        modulus.to_be_bytes().copy_into_slice(&mut mb);
+        let mv = eth_u256::from_be_bytes(mb);
+        let max_eth = eth_u256::from_be_bytes([0xffu8; 32]);
+        let av = (max_eth - eth_u256::from(1u8)) % mv;
+        let bv = (max_eth - eth_u256::from(2u8)) % mv;
+        let expected_eth = av + bv;
+        let expected_eth = if expected_eth >= mv {
+            expected_eth - mv
+        } else {
+            expected_eth
+        };
+        let expected = U256::from_be_bytes(
+            &env,
+            &Bytes::from_array(&env, &expected_eth.to_be_bytes()),
+        );
+
+        assert_eq!(result, expected);
+        assert!(result < modulus);
     }
 
     #[test]
