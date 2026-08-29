@@ -47,6 +47,32 @@ jobs:
       - name: 🛡️ Audit Dependencies (cargo-deny)
         uses: EmbarkStudios/cargo-deny-action@v2
 
+  halo2-primitives:
+    name: 🧩 Halo2 Verifier Primitives
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Stable Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-halo2-${{ hashFiles('**/Cargo.lock') }}
+
+      # Exercises the no_std Halo2 verifier primitives in soroban-zk-core
+      # (custom-gate evaluation loop, permutation grand-product argument, and the
+      # recursion/accumulation state) without depending on the higher-level
+      # soroban-zk-std verifier crate.
+      - name: 🧪 Run Halo2 primitive tests
+        run: cargo test -p soroban-zk-core --lib halo2
+
   miri-check:
     name: 🔬 Memory Safety (Miri)
     runs-on: ubuntu-latest
