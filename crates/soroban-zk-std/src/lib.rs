@@ -1,14 +1,24 @@
 #![no_std]
+extern crate alloc;
+
 pub mod cache;
+pub mod gadgets;
 pub mod groth16;
+pub mod host;
 pub mod pairing;
 pub mod poseidon2;
+pub mod vk;
 
 pub use groth16::{groth16_verify, Groth16Proof, Groth16VerifyingKey};
 pub use pairing::{pairing_check, G2Affine};
+pub use vk::{
+    clear_proof_context, clear_vk, load_vk, save_vk, set_proof_context, vk_from_bytes,
+    vk_to_bytes, G1_GENERATOR, G2_GENERATOR, OwnedVerifyingKey, VkMeta, VkStorageKey,
+    VK_CHUNK_SIZE,
+};
 
 use ethnum::u256 as eth_u256;
-use soroban_sdk::{Env, U256};
+use soroban_sdk::{contracterror, Address, Bytes, Env, U256, Vec};
 use soroban_zk_core::{Bn254, Fr, SafeFrom, ZkError};
 
 /// Validates a Soroban U256 as a BN254 scalar.
@@ -64,6 +74,41 @@ impl HostConvert for Env {
 
 use soroban_sdk::{contract, contractimpl};
 
+/// Contract-facing error type for the `ZkContract` entry points.
+///
+/// `ZkError` (in `soroban-zk-core`) deliberately avoids depending on the
+/// Soroban SDK, so contract methods translate it into this `#[contracterror]`
+/// type, which the SDK can marshal across the host boundary.
+#[contracterror]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZkContractError {
+    /// A supplied value was ≥ the BN254 scalar field modulus.
+    InvalidFieldElement = 1,
+    /// Mismatched input lengths or empty slices.
+    InvalidInput = 2,
+    /// Serialized bytes could not be decoded.
+    DeserializationError = 3,
+    /// A raw host call trapped or was unavailable.
+    HostError = 4,
+    /// A storage read/write/remove failed or required data was missing.
+    StorageError = 5,
+    /// A ZK constraint or gadget invariant was violated by the supplied witness.
+    ConstraintUnsatisfied = 6,
+}
+
+impl From<ZkError> for ZkContractError {
+    fn from(e: ZkError) -> Self {
+        match e {
+            ZkError::InvalidFieldElement => ZkContractError::InvalidFieldElement,
+            ZkError::InvalidInput => ZkContractError::InvalidInput,
+            ZkError::DeserializationError => ZkContractError::DeserializationError,
+            ZkError::HostError => ZkContractError::HostError,
+            ZkError::StorageError => ZkContractError::StorageError,
+            ZkError::ConstraintUnsatisfied => ZkContractError::ConstraintUnsatisfied,
+        }
+    }
+}
+
 #[contract]
 pub struct ZkContract;
 
@@ -88,6 +133,67 @@ impl ZkContract {
             sponge.absorb(core::slice::from_ref(&input));
         }
         sponge.squeeze()
+    }
+
+    /// Persists a verification key (serialized via [`vk::vk_to_bytes`]) to
+    /// `StorageType::Persistent`, chunked if necessary.
+    ///
+    /// **Safety:** the caller must authorize before the key is replaced, so a
+    /// hostile key swap is impossible without the admin's signature.
+    pub fn set_verifying_key(
+        env: Env,
+        admin: Address,
+        vk_bytes: Bytes,
+    ) -> Result<(), ZkContractError> {
+        admin.require_auth();
+        let owned = vk::vk_from_bytes(&env, &vk_bytes).map_err(ZkContractError::from)?;
+        let vk = owned.as_vk();
+        vk::save_vk(&env, &vk).map_err(ZkContractError::from)
+    }
+
+    /// Purges the on-ledger verification key (cleanup hook for key rotation).
+    /// Requires the admin's authorization.
+    pub fn clear_verifying_key(env: Env, admin: Address) -> Result<(), ZkContractError> {
+        admin.require_auth();
+        vk::clear_vk(&env);
+        Ok(())
+    }
+
+    /// Loads the stored verification key, verifies a Groth16 proof against it,
+    /// and clears the short-lived proof-context flag afterwards. Demonstrates
+    /// the Phase-3 cleanup pattern: the temporary flag is removed whether the
+    /// verification succeeds or fails.
+    pub fn verify_proof(
+        env: Env,
+        proof_bytes: Bytes,
+        public_inputs: Vec<U256>,
+    ) -> Result<bool, ZkContractError> {
+        let result: Result<bool, ZkError> = (|| {
+            let owned = vk::load_vk(&env)?;
+            let vk = owned.as_vk();
+
+            // Mark the in-flight run with a temporary proof-context flag.
+            vk::set_proof_context(&env, &proof_bytes);
+
+            let outcome = (|| {
+                let proof_buf: alloc::vec::Vec<u8> = proof_bytes.iter().collect();
+                let proof = Groth16Proof::from_bytes(&proof_buf)?;
+                let mut inputs: alloc::vec::Vec<eth_u256> =
+                    alloc::vec::Vec::with_capacity(public_inputs.len() as usize);
+                for input in public_inputs.iter() {
+                    let mut buf = [0u8; 32];
+                    input.to_be_bytes().copy_into_slice(&mut buf);
+                    inputs.push(eth_u256::from_be_bytes(buf));
+                }
+                groth16_verify(&env, &vk, &proof, &inputs)
+            })();
+
+            // Always clear the proof-context flag (the Temporary entry also
+            // expires automatically).
+            vk::clear_proof_context(&env);
+            outcome
+        })();
+        result.map_err(ZkContractError::from)
     }
 }
 

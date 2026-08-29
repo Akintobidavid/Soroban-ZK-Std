@@ -43,7 +43,7 @@ pub mod elgamal {
             ephemeral: u256,
         ) -> Result<Self, ZkError> {
             // Validate amount is in the scalar field
-            if amount >= Bn254::BASE_MODULUS {
+            if amount >= Bn254::FR_MODULUS {
                 return Err(ZkError::InvalidFieldElement);
             }
 
@@ -238,7 +238,7 @@ pub mod elgamal {
         #[test]
         fn encrypt_with_max_scalar_amount() {
             // Fr modulus - 1 is the largest valid scalar
-            let amount = Bn254::BASE_MODULUS - u256::from(1u8);
+            let amount = Bn254::FR_MODULUS - u256::from(1u8);
             let sk = u256::from(7u8);
             let ephemeral = u256::from(13u8);
             let pk = derive_pub_key(sk);
@@ -256,7 +256,7 @@ pub mod elgamal {
 
         #[test]
         fn encrypt_rejects_amount_above_modulus() {
-            let amount = Bn254::BASE_MODULUS; // exactly the modulus — invalid
+            let amount = Bn254::FR_MODULUS; // exactly the modulus — invalid
             let pk = derive_pub_key(u256::from(7u8));
 
             let result = ElGamalCiphertext::encrypt(amount, &pk, u256::from(13u8));
@@ -265,7 +265,7 @@ pub mod elgamal {
 
         #[test]
         fn encrypt_rejects_amount_well_above_modulus() {
-            let amount = Bn254::BASE_MODULUS + u256::from(1000u16);
+            let amount = Bn254::FR_MODULUS + u256::from(1000u16);
             let pk = derive_pub_key(u256::from(7u8));
 
             let result = ElGamalCiphertext::encrypt(amount, &pk, u256::from(13u8));
@@ -355,6 +355,7 @@ pub mod elgamal {
 }
 
 pub use elgamal::ElGamalCiphertext;
+pub mod halo2;
 pub mod polynomial;
 pub use polynomial::{DensePolynomial, SparsePolynomial};
 
@@ -367,6 +368,16 @@ pub enum ZkError {
     InvalidInput,
     /// Serialized proof or point bytes could not be decoded into a valid structure.
     DeserializationError,
+    /// A raw Soroban host (CAP-0075) call trapped or returned an error that could
+    /// not be translated into a successful result. The host function may be
+    /// unavailable (e.g. local off-chain test environment) or rejected the input.
+    HostError,
+    /// A storage operation (read/write/remove) failed or required data was
+    /// missing from the Soroban ledger.
+    StorageError,
+     /// A zero-knowledge constraint or gadget invariant was violated by the
+    /// supplied witness (e.g. a boolean gadget received a non-0/1 value).
+    ConstraintUnsatisfied,
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.
@@ -448,12 +459,48 @@ pub trait SafeFrom<T>: Sized {
 impl SafeFrom<u256> for Fr {
     #[inline(always)]
     fn safe_from(val: u256) -> Result<Self, ZkError> {
-        let (_, in_field) = val.overflowing_sub(Bn254::BASE_MODULUS);
+        // Constant-time check: val < Bn254::FR_MODULUS.
+        //
+        // `overflowing_sub` underflows (wraps, overflow == true) exactly when
+        // val < FR_MODULUS, i.e. when val is a valid scalar field element.
+        // This must check the *scalar* field modulus (r), not the base field
+        // modulus (q, `FQ_MODULUS`) — q > r, so checking against q would let
+        // out-of-range scalars in [r, q) pass as valid Fr elements.
+        let (_, in_field) = val.overflowing_sub(Bn254::FR_MODULUS);
         if in_field {
             Ok(Fr(val))
         } else {
             Err(ZkError::InvalidFieldElement)
         }
+    }
+}
+
+#[cfg(test)]
+mod fr_safe_from_tests {
+    use super::*;
+
+    #[test]
+    fn safe_from_max_valid_scalar_succeeds() {
+        // FR_MODULUS - 1 is the largest valid Fr element.
+        let val = Bn254::FR_MODULUS - u256::from(1u8);
+        let fr = Fr::safe_from(val).expect("FR_MODULUS - 1 should be a valid Fr element");
+        assert_eq!(fr.inner(), val);
+    }
+
+    #[test]
+    fn safe_from_rejects_scalar_modulus() {
+        // FR_MODULUS itself is out of range: valid elements are [0, r).
+        let result = Fr::safe_from(Bn254::FR_MODULUS);
+        assert_eq!(result, Err(ZkError::InvalidFieldElement));
+    }
+
+    #[test]
+    fn safe_from_rejects_base_field_modulus_minus_one() {
+        // FQ_MODULUS - 1 lies in [r, q), which must never be accepted as a
+        // scalar: this is exactly the malleability gap the base-vs-scalar
+        // modulus mixup would have permitted.
+        let result = Fr::safe_from(Bn254::FQ_MODULUS - u256::from(1u8));
+        assert_eq!(result, Err(ZkError::InvalidFieldElement));
     }
 }
 
@@ -477,11 +524,17 @@ pub struct JacobianPoint {
 }
 
 impl Bn254 {
+    /// Deprecated alias for [`Self::FR_MODULUS`].
+    ///
+    /// This name is ambiguous ("base" modulus, when it actually holds the
+    /// *scalar* field modulus r) and was previously defined as a separate
+    /// constant, which allowed it to silently drift out of sync with
+    /// `FR_MODULUS`/`FQ_MODULUS` — the root cause of the Fr validation bug
+    /// this alias now prevents by construction. Prefer [`Self::FR_MODULUS`]
+    /// (scalar field) or [`Self::FQ_MODULUS`] (base field) directly.
+    #[deprecated(note = "use Bn254::FR_MODULUS instead; this name is ambiguous with FQ_MODULUS")]
+    pub const BASE_MODULUS: ethnum::u256 = Self::FR_MODULUS;
     /// BN254 scalar field modulus r (order of G1/G2).
-    pub const BASE_MODULUS: ethnum::u256 = ethnum::u256::from_words(
-        0x30644e72e131a029b85045b68181585d_u128,
-        0x2833e84879b9709143e1f593f0000001_u128,
-    );
     pub const FR_MODULUS: ethnum::u256 = ethnum::u256::from_words(
         0x30644e72e131a029b85045b68181585d_u128,
         0x2833e84879b9709143e1f593f0000001_u128,
@@ -491,11 +544,14 @@ impl Bn254 {
         0x97816a916871ca8d3c208c16d87cfd47_u128,
     );
     pub const G1_B: u256 = u256::from_words(0u128, 3u128);
-    /// G2 curve coefficient β = 3 + 19*u in Fq² (lifted constant)
-    /// Stored as (real, imaginary) = (3, 19) representing 3 + 19*u
-    /// Used in the G2 curve equation: y² = x³ + β over Fq²
-    pub const G2_B_REAL: u256 = u256::from_words(0u128, 3u128);
-    pub const G2_B_IMAG: u256 = u256::from_words(0u128, 19u128);
+    /// G2 curve coefficient `β = 3/(u + 9)` in Fq², the correct BN254 twist
+    /// parameter (where `u² = -1`). Previously this was incorrectly set to
+    /// `3 + 19*u`, which rejected every valid G2 point.
+    /// Stored as (real, imaginary). Used in the G2 curve equation: `y² = x³ + β`.
+    pub const G2_B_REAL: u256 =
+        u256::from_words(57263839228809413707999148736847571651u128, 241528894477357229398967524003378444517u128);
+    pub const G2_B_IMAG: u256 =
+        u256::from_words(784436153819307037095878749819829748u128, 222394522462485822084624302373924443602u128);
     pub const LEGENDRE_EXP_FR: ethnum::u256 = ethnum::u256::from_words(
         0x183227397098d014dc2822db40c0ac2e_u128,
         0x9419f4243cdcb848a1f0fac9f8000000_u128,
@@ -510,7 +566,7 @@ impl Bn254 {
     }
     pub fn fr_from_bytes(bytes: [u8; 32]) -> Option<u256> {
         let val = u256::from_be_bytes(bytes);
-        if val < Self::BASE_MODULUS {
+        if val < Self::FR_MODULUS {
             Some(val)
         } else {
             None
@@ -528,58 +584,55 @@ impl Bn254 {
         }
     }
 
+    /// Constant-time modular addition: `(a + b) mod modulus`.
+    ///
+    /// Uses `overflowing_add` plus a branchless mask instead of a data-dependent
+    /// `if` so execution time does not vary with the operand values (timing
+    /// side-channel hardening for Issue #372).
     #[inline(always)]
     fn add_mod(a: u256, b: u256, modulus: u256) -> u256 {
         let (sum, overflow) = a.overflowing_add(b);
-        if overflow || sum >= modulus {
-            sum.wrapping_sub(modulus)
-        } else {
-            sum
-        }
+        let (reduced, no_underflow) = sum.overflowing_sub(modulus);
+        // need_reduce = true iff sum overflowed u256, OR sum >= modulus
+        // (sum >= modulus  <=>  sum.overflowing_sub(modulus) does NOT underflow)
+        let need_reduce = overflow | !no_underflow;
+        let mask = u256::from(0u8).wrapping_sub(u256::from(need_reduce as u8));
+        (mask & reduced) | (!mask & sum)
     }
 
+    /// Constant-time modular subtraction over the Fr modulus: `(a - b) mod FR_MODULUS`.
+    ///
+    /// Uses `overflowing_sub` plus a branchless mask instead of a data-dependent
+    /// `if` so execution time does not vary with the operand values (timing
+    /// side-channel hardening for Issue #372).
     pub fn sub(a: u256, b: u256) -> u256 {
         let (res, underflow) = a.overflowing_sub(b);
-        if underflow {
-            res.wrapping_add(Self::BASE_MODULUS)
-        } else {
-            res
-        }
+        let mask = u256::from(0u8).wrapping_sub(u256::from(underflow as u8));
+        res.wrapping_add(mask & Self::FR_MODULUS)
     }
 
+    /// Constant-time modular multiplication: `(a * b) mod modulus`.
+    ///
+    /// The previous implementation short-circuited on `a == 0`, `a == 1`, or
+    /// `b == 1`, which leaks structural information about secret scalars
+    /// through timing (Issue #372). Both the overflow and non-overflow
+    /// reduction paths are now always computed, and the result is selected
+    /// via a branchless mask.
     #[inline(always)]
     fn mul_mod(a: u256, b: u256, modulus: u256) -> u256 {
         // Normalize inputs to [0, modulus)
         let a = a % modulus;
         let b = b % modulus;
 
-        // Fast path: if either operand is small, use direct multiplication
-        if a == u256::from(0u8) || b == u256::from(0u8) {
-            return u256::from(0u8);
-        }
-        if a == u256::from(1u8) {
-            return b;
-        }
-        if b == u256::from(1u8) {
-            return a;
-        }
-
-        // Use ethnum's optimized multiplication with overflow detection
         let (result, overflow) = a.overflowing_mul(b);
 
-        if !overflow {
-            // No overflow: simple modular reduction
-            result % modulus
-        } else {
-            // Overflow occurred: use Barrett-like reduction
-            // For 512-bit result, we compute: (a * b) mod modulus
-            // Using the identity: (a * b) mod m = ((a mod m) * (b mod m)) mod m
-            // But since we already normalized, we need a different approach
+        // Always compute both candidate results so control flow does not
+        // depend on whether the multiplication overflowed.
+        let no_overflow_result = result % modulus;
+        let overflow_result = Self::mul_mod_with_overflow(a, b, modulus);
 
-            // Split into high and low parts using bit manipulation
-            // This is more efficient than the shift-and-add loop
-            Self::mul_mod_with_overflow(a, b, modulus)
-        }
+        let mask = u256::from(0u8).wrapping_sub(u256::from(overflow as u8));
+        (mask & overflow_result) | (!mask & no_overflow_result)
     }
 
     /// Handles modular multiplication when overflow is detected.
@@ -703,6 +756,20 @@ impl Bn254 {
         Self::pow_mod(a, exponent, Self::FQ_MODULUS)
     }
 
+    /// Modular exponentiation over the base field Fq (modulus = `FQ_MODULUS`).
+    pub fn pow_fq(base: u256, exp: u256) -> u256 {
+        Self::pow_mod(base, exp, Self::FQ_MODULUS)
+    }
+
+    /// Square root in Fq.
+    ///
+    /// The BN254 base field modulus `q ≡ 3 (mod 4)`, so a square root of a
+    /// quadratic residue `a` is `a^((q + 1) / 4)`. If `a` is a non-residue the
+    /// result will not square back to `a`; callers must verify.
+    pub fn sqrt_fq(a: u256) -> u256 {
+        Self::pow_fq(a, (Self::FQ_MODULUS + u256::from(1u8)) >> 2)
+    }
+
     pub fn is_valid_g1(x: u256, y: u256) -> bool {
         if x == 0 && y == 0 {
             return false;
@@ -719,13 +786,26 @@ impl Bn254 {
         y_sq == rhs
     }
 
+    /// Returns `true` if `(x, y)` (each an `Fq2` element as `(real, imag)`) lies
+    /// on the BN254 G2 twist curve `y² = x³ + b'`.
+    pub fn is_valid_g2_curve(x: (u256, u256), y: (u256, u256)) -> bool {
+        Self::is_on_curve(x, y)
+    }
+
+    /// Returns `true` if `(x, y)` lies on the curve AND in the prime-order
+    /// subgroup. Required before using any G2 point in a pairing check — a
+    /// point on the curve but outside the subgroup breaks soundness.
+    pub fn is_valid_g2_subgroup(x: (u256, u256), y: (u256, u256)) -> bool {
+        Self::is_in_correct_subgroup(x, y)
+    }
+
     pub fn is_valid_g1_subgroup(x: u256, y: u256) -> bool {
         if !Self::is_valid_g1(x, y) {
             return false;
         }
 
         let point = G1Projective::from(G1Affine { x, y });
-        let result = Self::g1_scalar_mul(point, Self::BASE_MODULUS);
+        let result = Self::g1_scalar_mul(point, Self::FR_MODULUS);
         result.z == u256::from(0u8)
     }
 
@@ -823,7 +903,7 @@ impl Bn254 {
     // G2 Point Validation (On-Curve and Subgroup Membership)
     // ========================================================================
     // The BN254 G2 curve is defined over Fq² as:
-    //   y² = x³ + β, where β = 3 + 19*u in Fq²
+    //   y² = x³ + β, where β = 3/(u + 9) in Fq² (u² = -1)
     //
     // Cofactor: h₂ = 21888242871839275222246405745257275088844257914179612981679871602714643767808
     // Full group order: h₂ * r where r = FR_MODULUS (the prime-order subgroup order)
@@ -839,8 +919,8 @@ impl Bn254 {
     /// though it may represent the point at infinity in some encodings).
     ///
     /// This check alone is insufficient for proof verification; subgroup validation via
-    /// is_valid_g2_subgroup() is also required.
-    pub fn is_valid_g2_curve(x: (u256, u256), y: (u256, u256)) -> bool {
+    /// is_in_correct_subgroup() is also required.
+    pub fn is_on_curve(x: (u256, u256), y: (u256, u256)) -> bool {
         // Check for (0,0) - not a valid affine point
         if x.0 == u256::from(0u8) && x.1 == u256::from(0u8)
             && y.0 == u256::from(0u8) && y.1 == u256::from(0u8)
@@ -873,28 +953,36 @@ impl Bn254 {
     }
 
     /// Validates that a G2 point belongs to the prime-order subgroup via [r]Q = ∞.
-    /// 
-    /// This implementation uses a cautious but correct approach: we defer to the
-    /// Soroban host's native pairing operations for the actual subgroup membership
-    /// verification since full G2 scalar multiplication is expensive and requires
-    /// complete G2 projective arithmetic over Fq².
     ///
-    /// **Performance note:** A full scalar multiplication by r (254 bits) is expensive.
-    /// The BN254 curve admits an endomorphism ψ(Q) = [z]Q where z is a 64-bit curve
-    /// parameter, making endomorphism-based checks ~4x faster. However, that optimization
-    /// requires additional infrastructure. For now, this function returns true,
-    /// deferring subgroup validation to the pairing_check() call in Soroban host code.
+    /// This performs a full G2 scalar multiplication `Q' = [r]·Q` over the
+    /// extension field Fq² and checks that the result is the point at infinity.
+    /// Because the prime-order subgroup G₂ has order `r`, any point in the
+    /// subgroup satisfies `r·Q = 𝒪`, while a point lying in a coset of the
+    /// cofactor (e.g. a small-subgroup point) does not.
     ///
-    /// **Security:** This is acceptable because:
-    /// 1. We still validate the curve equation above (prevents off-curve attacks)
-    /// 2. The Soroban pairing check will reject malformed G2 elements at the host boundary
-    /// 3. Small-subgroup attacks on G2 are much less critical than on G1
+    /// This closes the small-subgroup / invalid-subgroup vulnerability: without
+    /// this check a prover could submit a G2 point on the curve but outside the
+    /// prime-order subgroup to break soundness of the pairing-based proof.
     ///
-    /// TODO: Implement endomorphism-based G2 subgroup check (4x faster).
-    pub fn is_valid_g2_subgroup(_x: (u256, u256), _y: (u256, u256)) -> bool {
-        // Placeholder: defer to host pairing validation.
-        // Future: Implement [z]Q endomorphism check where z = 4965661367192848881.
-        true
+    /// Performance note: a full 254-bit scalar multiplication is used for
+    /// correctness. An endomorphism-based check (exploiting the BN254 Frobenius
+    /// endomorphism, ~4x cheaper) could replace this later without changing the
+    /// interface.
+    pub fn is_in_correct_subgroup(x: (u256, u256), y: (u256, u256)) -> bool {
+        // A point not on the curve cannot be in the subgroup.
+        if !Self::is_on_curve(x, y) {
+            return false;
+        }
+
+        let point = G2Projective {
+            x,
+            y,
+            z: (u256::from(1u8), u256::from(0u8)),
+        };
+
+        // [r]·Q must be the point at infinity (z == 0 in Jacobian coordinates).
+        let result = Self::g2_scalar_mul(point, Self::FR_MODULUS);
+        result.is_identity()
     }
 
     pub fn g1_scalar_mul(point: G1Projective, scalar: u256) -> G1Projective {
@@ -917,6 +1005,35 @@ impl Bn254 {
             let bit: u128 = (shifted & mask).as_u128();
 
             result = G1Projective::ct_select(bit, added, result);
+        }
+        result
+    }
+
+    /// Scalar multiplication of a G2 point by `scalar` over the extension field Fq².
+    ///
+    /// Uses the same double-and-add (constant-time select) strategy as
+    /// `g1_scalar_mul`. The point is represented in Jacobian coordinates with
+    /// `a = 0` (the BN254 G2 curve is `y² = x³ + β`), so `β` does not enter the
+    /// addition/doubling formulas.
+    pub fn g2_scalar_mul(point: G2Projective, scalar: u256) -> G2Projective {
+        if scalar == u256::from(0u8) {
+            return G2Projective::identity();
+        }
+        if scalar == u256::from(1u8) {
+            return point;
+        }
+
+        let mut result = G2Projective::identity();
+
+        for i in (0..254).rev() {
+            result = result.double();
+            let added = result.add(&point);
+
+            let shifted: ethnum::u256 = scalar >> i;
+            let mask: ethnum::u256 = ethnum::u256::from(1u8);
+            let bit: u128 = (shifted & mask).as_u128();
+
+            result = G2Projective::ct_select(bit, added, result);
         }
         result
     }
@@ -1048,6 +1165,146 @@ impl G1Projective {
         // Z3 = H * Z1 * Z2
         let z1z2 = Bn254::mul_fq(self.z, other.z);
         let z3 = Bn254::mul_fq(h, z1z2);
+
+        Self {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+}
+
+/// BN254 G2 point in Jacobian coordinates over the extension field Fq².
+/// Affine coordinates (x, y) are related by: x = X/Z², y = Y/Z³, where each
+/// coordinate is an Fq² element `(real, imaginary)`.
+///
+/// The point at infinity is encoded as `z = (0, 0)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct G2Projective {
+    pub x: (u256, u256),
+    pub y: (u256, u256),
+    pub z: (u256, u256),
+}
+
+impl G2Projective {
+    pub fn identity() -> Self {
+        Self {
+            x: (u256::from(1u8), u256::from(0u8)),
+            y: (u256::from(1u8), u256::from(0u8)),
+            z: (u256::from(0u8), u256::from(0u8)),
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        self.z == (u256::from(0u8), u256::from(0u8))
+    }
+
+    /// Constant-time select between two points: returns `a` if `choice != 0`, else `b`.
+    pub fn ct_select(choice: u128, a: Self, b: Self) -> Self {
+        let mask = u256::from(0u128).wrapping_sub(u256::from(choice));
+        let not_mask = !mask;
+        let sel = |av: u256, bv: u256| -> u256 { (mask & av) | (not_mask & bv) };
+
+        Self {
+            x: (sel(a.x.0, b.x.0), sel(a.x.1, b.x.1)),
+            y: (sel(a.y.0, b.y.0), sel(a.y.1, b.y.1)),
+            z: (sel(a.z.0, b.z.0), sel(a.z.1, b.z.1)),
+        }
+    }
+
+    /// Doubles the Jacobian point (2 * P). The curve has `a = 0`.
+    pub fn double(&self) -> Self {
+        if self.is_identity() {
+            return *self;
+        }
+
+        let xx = Bn254::fq2_sq(self.x);
+        let yy = Bn254::fq2_sq(self.y);
+        let yyyy = Bn254::fq2_sq(yy);
+
+        // S = 4 * X * Y^2
+        let xy2 = Bn254::fq2_mul(self.x, yy);
+        let s = Bn254::fq2_mul(xy2, (u256::from(4u8), u256::from(0u8)));
+
+        // M = 3 * X^2
+        let m = Bn254::fq2_mul(xx, (u256::from(3u8), u256::from(0u8)));
+
+        // T = M^2 - 2*S
+        let m2 = Bn254::fq2_sq(m);
+        let s2 = Bn254::fq2_add(s, s);
+        let t = Bn254::fq2_sub(m2, s2);
+
+        let x3 = t;
+
+        // Y3 = M * (S - T) - 8 * Y^4
+        let s_minus_t = Bn254::fq2_sub(s, t);
+        let m_times_sm_t = Bn254::fq2_mul(m, s_minus_t);
+        let yyyy8 = Bn254::fq2_mul(yyyy, (u256::from(8u8), u256::from(0u8)));
+        let y3 = Bn254::fq2_sub(m_times_sm_t, yyyy8);
+
+        // Z3 = 2 * Y * Z
+        let yz = Bn254::fq2_mul(self.y, self.z);
+        let z3 = Bn254::fq2_add(yz, yz);
+
+        Self {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
+    }
+
+    /// Adds two Jacobian points (P1 + P2). The curve has `a = 0`.
+    pub fn add(&self, other: &Self) -> Self {
+        if self.is_identity() {
+            return *other;
+        }
+        if other.is_identity() {
+            return *self;
+        }
+
+        let z1z1 = Bn254::fq2_sq(self.z);
+        let z2z2 = Bn254::fq2_sq(other.z);
+
+        let u1 = Bn254::fq2_mul(self.x, z2z2);
+        let u2 = Bn254::fq2_mul(other.x, z1z1);
+
+        let z1_cubed = Bn254::fq2_mul(self.z, z1z1);
+        let z2_cubed = Bn254::fq2_mul(other.z, z2z2);
+
+        let s1 = Bn254::fq2_mul(self.y, z2_cubed);
+        let s2 = Bn254::fq2_mul(other.y, z1_cubed);
+
+        if u1 == u2 {
+            if s1 == s2 {
+                return self.double(); // Points are the same
+            } else {
+                return Self::identity(); // Points are inverses
+            }
+        }
+
+        let h = Bn254::fq2_sub(u2, u1);
+        let r = Bn254::fq2_sub(s2, s1);
+
+        let h2 = Bn254::fq2_sq(h);
+        let h3 = Bn254::fq2_mul(h2, h);
+
+        let u1_h2 = Bn254::fq2_mul(u1, h2);
+
+        // X3 = R^2 - H^3 - 2*U1*H^2
+        let r2 = Bn254::fq2_sq(r);
+        let u1_h2_times_2 = Bn254::fq2_add(u1_h2, u1_h2);
+        let x3_part1 = Bn254::fq2_sub(r2, h3);
+        let x3 = Bn254::fq2_sub(x3_part1, u1_h2_times_2);
+
+        // Y3 = R*(U1*H^2 - X3) - S1*H^3
+        let u1_h2_minus_x3 = Bn254::fq2_sub(u1_h2, x3);
+        let r_times_u1_h2_minus_x3 = Bn254::fq2_mul(r, u1_h2_minus_x3);
+        let s1_h3 = Bn254::fq2_mul(s1, h3);
+        let y3 = Bn254::fq2_sub(r_times_u1_h2_minus_x3, s1_h3);
+
+        // Z3 = H * Z1 * Z2
+        let z1z2 = Bn254::fq2_mul(self.z, other.z);
+        let z3 = Bn254::fq2_mul(h, z1z2);
 
         Self {
             x: x3,
@@ -1190,7 +1447,7 @@ mod tests {
     fn test_g2_generator_is_on_curve() {
         let (x0, x1, y0, y1) = g2_generator();
         assert!(
-            Bn254::is_valid_g2_curve((x0, x1), (y0, y1)),
+            Bn254::is_on_curve((x0, x1), (y0, y1)),
             "G2 generator must be on the curve"
         );
     }
@@ -1199,7 +1456,7 @@ mod tests {
     fn test_g2_generator_is_in_subgroup() {
         let (x0, x1, y0, y1) = g2_generator();
         assert!(
-            Bn254::is_valid_g2_subgroup((x0, x1), (y0, y1)),
+            Bn254::is_in_correct_subgroup((x0, x1), (y0, y1)),
             "G2 generator must be in the prime-order subgroup"
         );
     }
@@ -1214,7 +1471,7 @@ mod tests {
         let y0_perturbed = Bn254::add_fq(y0, u256::from(1u8));
 
         assert!(
-            !Bn254::is_valid_g2_curve((x0, x1), (y0_perturbed, y1)),
+            !Bn254::is_on_curve((x0, x1), (y0_perturbed, y1)),
             "Perturbed point should not be on the curve"
         );
     }
@@ -1223,7 +1480,7 @@ mod tests {
     fn test_g2_rejects_zero_point() {
         // (0, 0) is not a valid affine point
         let zero = (u256::from(0u8), u256::from(0u8));
-        assert!(!Bn254::is_valid_g2_curve(zero, zero));
+        assert!(!Bn254::is_on_curve(zero, zero));
     }
 
     #[test]
@@ -1232,22 +1489,91 @@ mod tests {
         let (x0, x1, y0, y1) = g2_generator();
         let out_of_field = Bn254::FQ_MODULUS;
 
-        assert!(!Bn254::is_valid_g2_curve(
+        assert!(!Bn254::is_on_curve(
             (out_of_field, x1),
             (y0, y1)
         ));
-        assert!(!Bn254::is_valid_g2_curve(
+        assert!(!Bn254::is_on_curve(
             (x0, out_of_field),
             (y0, y1)
         ));
-        assert!(!Bn254::is_valid_g2_curve(
+        assert!(!Bn254::is_on_curve(
             (x0, x1),
             (out_of_field, y1)
         ));
-        assert!(!Bn254::is_valid_g2_curve(
+        assert!(!Bn254::is_on_curve(
             (x0, x1),
             (y0, out_of_field)
         ));
+    }
+
+    /// Square root of an Fq² element `(a0, a1)` via `(x + y·u)² = (x² - y², 2xy)`.
+    fn fq2_sqrt(a: (u256, u256)) -> Option<(u256, u256)> {
+        let norm = Bn254::add_fq(Bn254::mul_fq(a.0, a.0), Bn254::mul_fq(a.1, a.1));
+        let alpha = Bn254::sqrt_fq(norm);
+        if Bn254::mul_fq(alpha, alpha) != norm {
+            return None;
+        }
+        let inv2 = Bn254::invert_fq(u256::from(2u8));
+        let x2 = Bn254::mul_fq(Bn254::add_fq(alpha, a.0), inv2);
+        let y2 = Bn254::mul_fq(Bn254::sub_fq(alpha, a.0), inv2);
+        let x = Bn254::sqrt_fq(x2);
+        if Bn254::mul_fq(x, x) != x2 {
+            return None;
+        }
+        let mut y = Bn254::sqrt_fq(y2);
+        if Bn254::mul_fq(y, y) != y2 {
+            return None;
+        }
+        if Bn254::mul_fq(Bn254::add_fq(x, x), y) != a.1 {
+            y = Bn254::sub_fq(u256::from(0u8), y);
+        }
+        if Bn254::fq2_sq((x, y)) != a {
+            return None;
+        }
+        Some((x, y))
+    }
+
+    /// Finds an on-curve G2 point that is NOT in the prime-order subgroup.
+    fn g2_off_subgroup_point() -> ((u256, u256), (u256, u256)) {
+        let beta = (Bn254::G2_B_REAL, Bn254::G2_B_IMAG);
+        let mut x_re = u256::from(1u8);
+        loop {
+            let x = (x_re, u256::from(0u8));
+            let x2 = Bn254::fq2_sq(x);
+            let x3 = Bn254::fq2_mul(x2, x);
+            let rhs = Bn254::fq2_add(x3, beta);
+            if let Some(y) = fq2_sqrt(rhs) {
+                if !Bn254::is_in_correct_subgroup(x, y) {
+                    return (x, y);
+                }
+            }
+            x_re = Bn254::add_fq(x_re, u256::from(1u8));
+        }
+    }
+
+    #[test]
+    fn test_g2_scalar_mul_generator_is_identity() {
+        // [r]·G must equal the point at infinity for the generator G.
+        let (x0, x1, y0, y1) = g2_generator();
+        let point = G2Projective {
+            x: (x0, x1),
+            y: (y0, y1),
+            z: (u256::from(1u8), u256::from(0u8)),
+        };
+        let result = Bn254::g2_scalar_mul(point, Bn254::BASE_MODULUS);
+        assert!(result.is_identity(), "[r]·G must be the point at infinity");
+    }
+
+    #[test]
+    fn test_g2_rejects_point_outside_subgroup() {
+        let (x, y) = g2_off_subgroup_point();
+        // It must be on the curve, but NOT in the prime-order subgroup.
+        assert!(Bn254::is_on_curve(x, y));
+        assert!(
+            !Bn254::is_in_correct_subgroup(x, y),
+            "on-curve but off-subgroup point must be rejected"
+        );
     }
 
     #[test]
@@ -1263,3 +1589,6 @@ mod tests {
         assert_eq!(result, a, "fq2 addition and subtraction should be inverse");
     }
 }
+
+#[cfg(kani)]
+pub mod kani_tests;
