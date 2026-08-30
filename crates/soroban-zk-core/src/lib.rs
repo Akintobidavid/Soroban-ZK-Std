@@ -846,6 +846,7 @@ impl Bn254 {
         }
     }
 
+    fn mul_mod_naive(a: u256, b: u256, modulus: u256) -> u256 {
         let (result, overflow) = a.overflowing_mul(b);
 
         // Always compute both candidate results so control flow does not
@@ -857,6 +858,7 @@ impl Bn254 {
         (mask & overflow_result) | (!mask & no_overflow_result)
     }
 
+    fn mul_mod_with_overflow(a: u256, b: u256, modulus: u256) -> u256 {
         let mask_128 = u256::from(u128::MAX);
         let a_low = a & mask_128;
         let a_high = a >> 128;
@@ -1804,7 +1806,7 @@ mod tests {
             y: (y0, y1),
             z: (u256::from(1u8), u256::from(0u8)),
         };
-        let result = Bn254::g2_scalar_mul(point, Bn254::BASE_MODULUS);
+        let result = Bn254::g2_scalar_mul(point, Bn254::FR_MODULUS);
         assert!(result.is_identity(), "[r]·G must be the point at infinity");
     }
 
