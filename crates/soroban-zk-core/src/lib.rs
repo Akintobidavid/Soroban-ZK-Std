@@ -1,7 +1,12 @@
 #![no_std]
 use ethnum::u256;
+#[allow(unused_extern_crates)]
+extern crate self as zk_core;
 
 pub mod bulletproofs;
+pub mod g1;
+pub mod groth16;
+pub mod hash;
 pub mod elgamal {
     use super::*;
 
@@ -379,6 +384,10 @@ pub enum ZkError {
      /// A zero-knowledge constraint or gadget invariant was violated by the
     /// supplied witness (e.g. a boolean gadget received a non-0/1 value).
     ConstraintUnsatisfied,
+}
+
+pub mod error {
+    pub use crate::ZkError;
 }
 
 /// A BN254 scalar field element guaranteed to be in the range `[0, r)`.
