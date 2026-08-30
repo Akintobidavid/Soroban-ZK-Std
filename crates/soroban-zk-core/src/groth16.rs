@@ -8,8 +8,15 @@ pub struct Groth16Verifier {
 }
 
 impl Groth16Verifier {
-    pub fn new(vk: VerifyingKey<Bn254>) -> Self { Self { vk } }
-    pub fn verify(&self, proof: &Proof<Bn254>, public_inputs: &[Fr]) -> Result<bool, ark_groth16::VerificationError> {
+    pub fn new(vk: VerifyingKey<Bn254>) -> Self {
+        Self { vk }
+    }
+
+    pub fn verify(
+        &self,
+        proof: &Proof<Bn254>,
+        public_inputs: &[Fr],
+    ) -> Result<bool, ark_groth16::VerificationError> {
         let pvk = prepare_verifying_key(&self.vk);
         ark_groth16::verify_proof(&pvk, proof, public_inputs)
     }
