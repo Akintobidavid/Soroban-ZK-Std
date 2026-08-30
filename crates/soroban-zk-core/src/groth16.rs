@@ -1,4 +1,4 @@
-use ark_bn254:{Bn254, Fr};
+use ark_bn254::{Bn254, Fr};
 use ark_groth16::prepare_verifying_key;
 
 pub use ark_groth16::{Proof, VerifyingKey};
