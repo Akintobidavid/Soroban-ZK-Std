@@ -8,12 +8,6 @@ pub mod g1;
 pub mod groth16;
 pub mod hash;
 
-pub mod error {
-    pub use crate::g1::ZkError;
-}
-
-pub use error::ZkError;
-pub use g1::{Bn254, G1Affine};
 pub mod elgamal {
     use super::*;
 
